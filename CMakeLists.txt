@@ -12,7 +12,10 @@ find_package(nlohmann_json CONFIG REQUIRED)
 # ---- Sources ----
 set(SERVER_SOURCES
     main.cpp                                   # main ở THƯ MỤC GỐC
-    src/modules/ProcessManager.cpp
+    src/modules/ProcessManager_win.cpp
+    src/modules/SystemManager_win.cpp
+    src/modules/ScreenManager_win.cpp
+    src/modules/AppManager_win.cpp
     # thêm các .cpp khác nếu có
 )
 

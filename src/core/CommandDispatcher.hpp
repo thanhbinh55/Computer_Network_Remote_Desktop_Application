@@ -6,12 +6,30 @@
 #include <memory>
 #include <string>
 #include <iostream>
+#include "modules/ProcessManager.hpp"
+#include "modules/SystemManager.hpp"
+#include "modules/ScreenManager.hpp"
+#include "modules/AppManager.hpp"
 
 class CommandDispatcher {
 private:
     std::unordered_map<std::string, std::unique_ptr<IRemoteModule>> modules_;
 
-public:
+public: 
+    CommandDispatcher() {
+        // Đăng ký PROCESS
+        register_module(std::make_unique<ProcessManager>());
+
+        // Đăng ký SYSTEM
+        register_module(std::make_unique<SystemManager>());
+    
+        // Đăng ký SCREEN
+        register_module(std::make_unique<ScreenManager>());
+
+        // Đăng ký APP
+        register_module(std::make_unique<AppManager>());
+    }
+
     void register_module(std::unique_ptr<IRemoteModule> module) {
         if (!module) return;
         const std::string name = module->get_module_name();   // lấy tên TRƯỚC khi move

@@ -23,7 +23,7 @@ static std::string to_utf8(const std::wstring& wide_str) {
 
 // ==== WINDOWS IMPL ====
 
-json ProcessManager::list_processes_impl() {
+json ProcessManager::list_processes() {
     json process_list = json::array();
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
 
@@ -50,7 +50,7 @@ json ProcessManager::list_processes_impl() {
     };
 }
 
-json ProcessManager::kill_process_impl(unsigned long pid) {
+json ProcessManager::kill_process(unsigned long pid) {
     // Không cho tự kill chính server
     const DWORD self = GetCurrentProcessId();
     if (static_cast<DWORD>(pid) == self) {
@@ -91,12 +91,12 @@ json ProcessManager::kill_process_impl(unsigned long pid) {
     return {
         {"status","success"},
         {"module", get_module_name()},
-        {"action","KILL"},
+        {"command","KILL"},
         {"pid", pid}
     };
 }
 
-json ProcessManager::start_process_impl(const std::string& path) {
+json ProcessManager::start_process(const std::string& path) {
     STARTUPINFOA si{};
     PROCESS_INFORMATION pi{};
     si.cb = sizeof(si);
@@ -125,7 +125,7 @@ json ProcessManager::start_process_impl(const std::string& path) {
     return {
         {"status","success"},
         {"module", get_module_name()},
-        {"action","START"},
+        {"command","START"},
         {"pid", static_cast<unsigned long>(child_pid)},
         {"path", path}
     };
@@ -136,7 +136,7 @@ json ProcessManager::start_process_impl(const std::string& path) {
 json ProcessManager::handle_command(const json& request) {
     const std::string command = request.value("command", "");
     if (command == "LIST") {
-        return list_processes_impl();
+        return list_processes();
     }
     if (command == "KILL") {
         if (!request.contains("pid") || !request["pid"].is_number_unsigned()) {
@@ -147,7 +147,7 @@ json ProcessManager::handle_command(const json& request) {
             };
         }
         const unsigned long pid = request["pid"].get<unsigned long>();
-        return kill_process_impl(pid);
+        return kill_process(pid);
     }
     if (command == "START") {
         const std::string path = request.value("path", "");
@@ -158,7 +158,7 @@ json ProcessManager::handle_command(const json& request) {
                 {"message","Missing 'path' parameter"}
             };
         }
-        return start_process_impl(path);
+        return start_process(path);
     }
 
     return {

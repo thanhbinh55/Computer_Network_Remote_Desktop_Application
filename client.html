@@ -13,11 +13,26 @@
         #process-table { width: 100%; border-collapse: collapse; margin-top: 15px; }
         #process-table th, #process-table td { border: 1px solid #ddd; padding: 8px; text-align: left; font-size: 0.9em; }
         #process-table th { background-color: #f2f2f2; cursor: pointer; }
+
+        /* 🔹 NEW: khu vực hiển thị screenshot */
+        #screen-wrapper {
+            margin-top: 20px;
+        }
+        #screen-image {
+            max-width: 100%;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            margin-top: 10px;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>⚙️ Remote Control - Process Manager</h1>
+        <div class="controls">
+            <button onclick="shutdownSystem()" style="background-color: #ff5733;">Shutdown System</button>
+            <button onclick="restartSystem()" style="background-color: #ffc300;">Restart System</button>
+        </div>
         
         <div class="controls">
             <button id="btn-connect" onclick="connectWS()">Connect/Reconnect (9001)</button>
@@ -28,37 +43,55 @@
 
             <input type="number" id="kill-pid" placeholder="PID to Kill" style="width: 100px; padding: 8px;">
             <button onclick="killProcess()" style="background-color: #dc3545;">3. Kill PID</button>
+
+            <!-- 🔹 NEW: nút chụp màn hình -->
+            <button onclick="captureScreen()" style="background-color: #28a745;">4. Capture Screen</button>
+            <button onclick="listApplications()">List Applications</button>
+            <button onclick="startApplication('Calculator')">Start Calculator</button>
+            <button onclick="killApplication('Calculator')">Kill Calculator</button>
+
+            
+        
         </div>
 
         <h3>Console Log</h3>
         <div class="log-box" id="output"></div>
 
+        <!-- 🔹 NEW: khu vực hiển thị screenshot -->
+        <div id="screen-wrapper">
+            <h3>Screen Capture</h3>
+            <small>(Ảnh mới nhất chụp từ máy remote)</small><br>
+            <img id="screen-image" alt="No screenshot yet">
+        </div>
+
         <h3>Process List (Click on PID to Kill)</h3>
         <table id="process-table">
             <thead>
-                <tr><th>PID</th><th>Name</th><th>Threads</th><th>Action</th></tr>
+                <tr><th>PID</th><th>Name</th><th>Threads</th><th>command</th></tr>
             </thead>
             <tbody id="process-table-body">
-                </tbody>
+            </tbody>
         </table>
     </div>
 
     <script>
         let ws = null;
         // const WS_URL = 'ws://127.0.0.1:9001'; 
-       // const WS_URL = 'ws://127.0.0.1:9010';
-  
+        const WS_URL = 'ws://127.0.0.1:9010';
         // const WS_URL = "ws://192.168.137.1:9010";
-
-        const WS_URL = "ws://10.29.160.254:9010";
+        //const WS_URL = "ws://10.29.160.111:9010";
+        // const WS_URL = "ws://192.168.88.163:9010";
 
         const output = document.getElementById('output');
+        const screenImg = document.getElementById('screen-image'); // 🔹 NEW
         
         // UTILITY FUNCTIONS
         function logStatus(message, color = 'white') {
-            output.innerHTML += `<div style="color: ${color};">${message}</div>`;
-            output.scrollTop = output.scrollHeight;
-        }
+    output.innerHTML += 
+        `<pre style="color:${color}; margin:0; white-space:pre-wrap;">${message}</pre>`;
+    output.scrollTop = output.scrollHeight;
+}
+
 
         // 1. WEBSOCKET CONNECTION
         function connectWS(){
@@ -113,21 +146,99 @@
             }
         }
 
+        // Ham xu ly shutdown
+        function shutdownSystem() {
+            sendCommand('SYSTEM', 'SHUTDOWN');
+        }
+
+        // Ham xu ly restart
+        function restartSystem() {
+            sendCommand('SYSTEM', 'RESTART');
+        }
+
+        // 🔹 NEW: gửi lệnh chụp màn hình
+        function captureScreen() {
+            sendCommand('SCREEN', 'CAPTURE');
+        }
+
+        // 🔹 NEW: hiển thị ảnh screen từ base64
+        function showScreenFromBase64(base64, format) {
+            // Backend bạn hiện đang trả BMP_BASE64, nên dùng image/bmp
+            // Nếu sau này đổi sang PNG thì chỉnh mime = 'image/png'
+            const mime = (format === 'PNG_BASE64' || format === 'PNG') ? 'image/png' : 'image/bmp';
+            screenImg.src = `data:${mime};base64,${base64}`;
+        }
+
+        // list app
+        function listApplications() {
+            sendCommand('APP', 'LIST_APPS');
+        }
+
+        // start app
+        function startApplication(appName) {
+            sendCommand('APP', 'START_APP', { app_name: appName });
+        }
+
+        // kill app
+        function killApplication(appName) {
+            sendCommand('APP', 'KILL_APP', { app_name: appName });
+        }
+
+
         // 4. RESPONSE HANDLER
         function handleServerResponse(response) {
-            if (response.status === 'success') {
-                logStatus(`[SUCCESS] ${response.module} ${response.command}: ${response.message || 'OK'}`, 'lime');
-                
-                if (response.module === 'PROCESS' && response.command === 'LIST' && response.data) {
-                    displayProcesses(response.data.process_list || response.data);
-                }
+    // luôn log toàn bộ JSON trước
+    logJSON(response, 'cyan');
 
-            } else if (response.status === 'error') {
-                logStatus(`[ERROR] ${response.module || 'CORE'}: ${response.message}`, 'red');
-            } else {
-                 logStatus(`[UNKNOWN] ${JSON.stringify(response)}`, 'yellow');
+    // --- SUCCESS ---
+    if (response.status === 'success') {
+
+        // PROCESS/LIST
+        if (response.module === 'PROCESS' && response.command === 'LIST') {
+            const list = response.data.process_list || response.data;
+            displayProcesses(list);
+            logStatus(`Process count = ${list.length}`, 'yellow');
+        }
+
+        // APP/LIST_APPS (sau này dùng)
+        if (response.module === 'APP' && response.command === 'LIST_APPS') {
+            logStatus(`Received ${response.apps.length} applications`, 'orange');
+        }
+
+        // SCREEN/CAPTURE
+        if (response.module === 'SCREEN' && response.command === 'CAPTURE') {
+            if (response.image_base64) {
+                showScreenFromBase64(response.image_base64, response.format);
+                logStatus("Screenshot updated.", "#00ffcc");
             }
         }
+
+        // SYSTEM ACTIONS (shutdown + restart)
+        if (response.module === 'SYSTEM') {
+            if (response.command === 'SHUTDOWN') {
+                logStatus("⚠ System is shutting down!", "red");
+            }
+            if (response.command === 'RESTART') {
+                logStatus("⚠ System is restarting!", "yellow");
+            }
+        }
+        return;
+    }
+
+    // --- ERROR ---
+    if (response.status === 'error') {
+        logStatus(`[ERROR] ${response.message}`, 'red');
+        return;
+    }
+
+    // --- UNKNOWN ---
+    logJSON(response, 'yellow');
+}
+
+function logJSON(obj, color = 'white') {
+    const pretty = JSON.stringify(obj, null, 2);
+    logStatus(pretty, color);
+}
 
         // 5. UI DISPLAY
         function displayProcesses(processes) {
@@ -143,12 +254,12 @@
                 row.insertCell().textContent = p.name;
                 row.insertCell().textContent = p.threads || 'N/A';
                 
-                const actionCell = row.insertCell();
+                const commandCell = row.insertCell();
                 const killBtn = document.createElement('button');
                 killBtn.textContent = 'Kill';
                 killBtn.style.backgroundColor = '#dc3545';
                 killBtn.onclick = () => killProcess(p.pid);
-                actionCell.appendChild(killBtn);
+                commandCell.appendChild(killBtn);
             });
             logStatus(`Displayed ${processes.length} processes.`, 'yellow');
         }
