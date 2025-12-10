@@ -6,7 +6,7 @@ json ScreenManager::handle_command(const json& request) {
     return { {"status", "ok"} };
 }
 
-bool ScreenManager::capture_screen_data(std::vector<uint8_t>& out_buffer, std::string& error_msg) {
+bool ScreenManager::capture_screen_data(std::vector<uint8_t>& out_buffer, std::string& error_msg, bool save_to_disk) {
     error_msg.clear();
 
     // 1. Kết nối với X Server
