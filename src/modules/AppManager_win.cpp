@@ -1,3 +1,9 @@
+#include "AppManager.hpp"
+#include <unordered_map>
+#include <algorithm> // cho std::transform
+#include <cctype>    // cho ::tolower
+#include <vector>
+
 #if _WIN32
 #include "AppManager.hpp"
 #include <unordered_map>
@@ -64,7 +70,7 @@ json AppManager::list_apps() {
         {"status","success"},
         {"module", get_module_name()},
         {"command","LIST"},
-        {"data", apps}
+        {"apps", apps}
     };
 }
 

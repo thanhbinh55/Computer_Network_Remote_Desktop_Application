@@ -159,7 +159,7 @@ json ProcessManager::list_processes() {
         {"status", "success"},
         {"module", get_module_name()}, 
         {"command", "LIST"},
-        {"data", process_list}
+        {"data", {{"process_list", process_list}}}
     };
 }
 

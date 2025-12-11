@@ -8,6 +8,7 @@
 
 void WebcamManager::stop_stream() {
     running_ = false;
+    time_ = -1;
     if (stream_thread_.joinable()) {
         stream_thread_.join();
     }
@@ -17,7 +18,7 @@ void WebcamManager::start_stream(StreamCallback callback) {
     stop_stream();
     running_ = true;
 
-    // VIẾT LOGIC FFMPEG TRONG LAMBDA (GIỐNG WINDOWS)
+    // VIẾT LOGIC FFMPEG TRONG LAMBDA 
     stream_thread_ = std::thread([this, callback]() {
         const char* cmd = "ffmpeg -f v4l2 -framerate 25 -video_size 640x480 -i /dev/video0 -f image2pipe -vcodec mjpeg -q:v 10 pipe:1 2>/dev/null";
         FILE* pipe = popen(cmd, "r");
@@ -28,6 +29,8 @@ void WebcamManager::start_stream(StreamCallback callback) {
         std::vector<uint8_t> read_chunk(4096);
         const std::vector<uint8_t> jpeg_start = {0xFF, 0xD8};
         const std::vector<uint8_t> jpeg_end   = {0xFF, 0xD9};
+
+        auto start = std::chrono::steady_clock::now();
 
         while (running_) {
             size_t bytes_read = fread(read_chunk.data(), 1, read_chunk.size(), pipe);
@@ -53,6 +56,14 @@ void WebcamManager::start_stream(StreamCallback callback) {
                 callback(jpg_frame);
 
                 buffer.erase(buffer.begin(), end_it + 2);
+
+                auto now = std::chrono::steady_clock::now();
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start);
+                unsigned long long duration = static_cast<unsigned long long>(elapsed.count()); // .count() trả về long long
+                std::cout << duration << "\n";
+
+                if (time_ != -1 && duration >= time_) // Đã quá thời gian quay
+                    stop_stream();
             }
         }
         pclose(pipe);

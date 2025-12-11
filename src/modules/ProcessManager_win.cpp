@@ -1,5 +1,4 @@
 #include "ProcessManager.hpp"
-#include <iostream>
 
 const std::string& ProcessManager::get_module_name() const {
     static const std::string name = "PROCESS";

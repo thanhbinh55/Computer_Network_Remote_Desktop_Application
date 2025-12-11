@@ -4,8 +4,6 @@
 #include <atomic>
 #include <vector>
 #include <thread>
-#include <iostream>
-#include <vector>
 
 #if _WIN32
 #include <windows.h>
@@ -15,6 +13,7 @@
 #include <mfidl.h>
 #include <mfreadwrite.h>
 #else
+#include <jpeglib.h>
 #endif
 
 class WebcamManager : public IRemoteModule {
@@ -42,4 +41,5 @@ public:
 private:
     std::atomic<bool> running_{false};
     std::thread stream_thread_;
+    unsigned long long time_ = 15; // tính theo second, nếu là -1 tức là ô time để trống
 };

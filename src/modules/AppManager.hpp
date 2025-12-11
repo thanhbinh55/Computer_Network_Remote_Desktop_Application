@@ -7,7 +7,7 @@
 #include <algorithm>
 #include <cctype>
 
-#if _WIN32
+#ifdef _WIN32
 #include <tlhelp32.h>
 #include <windows.h> 
 #else
