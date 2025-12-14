@@ -51,6 +51,13 @@ export class WebSocketService {
   // =============================
   // CONNECT
   // =============================
+  disconnect() {
+  if (this.socket) {
+    this.socket.close();          // 🔴 đóng WS
+    this.socket = null;
+    this.status.update(() => 'disconnected');// cập nhật status (signal/observable)
+  }
+}
   connect(ip: string, port: number) {
     const url = `ws://${ip}:${port}`;
     console.log("Connecting WS:", url);

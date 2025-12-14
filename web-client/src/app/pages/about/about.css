@@ -1,7 +1,4 @@
-.about-page {
-  padding: 50px 60px;
-  max-width: 1200px;
-}
+
 
 .about-hero {
   margin-bottom: 50px;
@@ -125,3 +122,50 @@
   color: #00ff9c;
   opacity: 0.8;
 }
+.about-page {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+
+  width: 100%;
+  max-width: 1200px;
+
+  margin: 0 auto;            /* 🔑 CÁI QUAN TRỌNG NHẤT */
+  padding: 60px 24px 80px;
+}
+
+.panel {
+  width: 100%;  /* hoặc 1200px nếu bạn thích rộng */
+  margin: 0 auto 36px;
+
+  padding: 32px 36px;
+  border-radius: 18px;
+}
+.about-hero {
+  width: 100%;
+  text-align: center;  
+  margin: 0 auto 60px;
+}
+.about-hero h1 {
+  margin: 0 auto 12px;
+}
+.about-hero {
+  padding: 40px 0 20px;
+}
+
+.about-hero h1 {
+  text-shadow:
+    0 0 20px rgba(0,255,255,0.35);
+}
+
+.about-hero .subtitle {
+  margin: 0 auto;
+  max-width: 720px;     /* tránh dòng quá dài */
+}
+.features-grid,
+.team-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 24px;
+}
+

