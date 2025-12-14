@@ -7,8 +7,8 @@
 #include <algorithm>
 #include <cctype>
 
-#if _WIN32
-#include <windows.h>
+#ifdef _WIN32
+#include <windows.h> 
 #include <tlhelp32.h>
 #else
 #include <dirent.h> // for listing apps, processes
@@ -16,6 +16,10 @@
 #include <signal.h> // for killing apps, processes
 #include <fstream> 
 #include <wait.h> // wait for children processes
+#include <pwd.h>
+#include <iostream>
+#include <sys/types.h>
+#include <grp.h> // for using initgroups
 #endif
 
 using nlohmann::json;

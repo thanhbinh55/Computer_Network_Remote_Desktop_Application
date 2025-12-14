@@ -5,6 +5,7 @@
 #include <sstream>
 #include <direct.h> // _mkdir
 #include <chrono>   // Để đo thời gian lưu file
+#include <iostream>
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "mf.lib")
@@ -13,6 +14,7 @@
 #pragma comment(lib, "mfuuid.lib")
 
 using namespace Gdiplus;
+using namespace std;
 
 // --- HELPER: GDI+ Encoder (Static) ---
 static int GetEncoderClsid(const WCHAR* format, CLSID* pClsid) {

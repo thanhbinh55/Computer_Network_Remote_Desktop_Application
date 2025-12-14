@@ -10,10 +10,16 @@
 #include <tlhelp32.h>
 #else
 #include <signal.h>
-#include <wait.h>
 #include <unistd.h>
-#include <sys/types.h>
 #include <cstdlib>
+#include <unistd.h> // unix system api
+#include <signal.h> // for killing apps, processes
+#include <fstream> 
+#include <wait.h> // wait for children processes
+#include <pwd.h>
+#include <iostream>
+#include <sys/types.h>
+#include <grp.h> // for using initgroups
 #include <dirent.h>
 #endif
 

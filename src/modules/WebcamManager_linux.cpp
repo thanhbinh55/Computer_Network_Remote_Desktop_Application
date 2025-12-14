@@ -17,7 +17,7 @@ void WebcamManager::start_stream(StreamCallback callback) {
     stop_stream();
     running_ = true;
 
-    // VIẾT LOGIC FFMPEG TRONG LAMBDA (GIỐNG WINDOWS)
+    // VIẾT LOGIC FFMPEG TRONG LAMBDA 
     stream_thread_ = std::thread([this, callback]() {
         const char* cmd = "ffmpeg -f v4l2 -framerate 25 -video_size 640x480 -i /dev/video0 -f image2pipe -vcodec mjpeg -q:v 10 pipe:1 2>/dev/null";
         FILE* pipe = popen(cmd, "r");

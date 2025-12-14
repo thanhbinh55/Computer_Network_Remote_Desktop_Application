@@ -4,8 +4,6 @@
 #include <atomic>
 #include <vector>
 #include <thread>
-#include <iostream>
-#include <vector>
 
 #if _WIN32
 #include <windows.h>
@@ -15,6 +13,7 @@
 #include <mfidl.h>
 #include <mfreadwrite.h>
 #else
+#include <jpeglib.h>
 #endif
 
 class WebcamManager : public IRemoteModule {
