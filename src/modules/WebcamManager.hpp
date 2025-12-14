@@ -41,5 +41,4 @@ public:
 private:
     std::atomic<bool> running_{false};
     std::thread stream_thread_;
-    unsigned long long time_ = 15; // tính theo second, nếu là -1 tức là ô time để trống
 };

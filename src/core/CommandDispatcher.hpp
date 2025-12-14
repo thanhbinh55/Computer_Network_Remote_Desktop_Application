@@ -10,6 +10,8 @@
 #include "../modules/AppManager.hpp"
 #include "../modules/WebcamManager.hpp"
 #include "../modules/KeyManager.hpp"
+#include "../modules/FileManager.hpp"
+#include "../modules/InputManager.hpp"
 
 class CommandDispatcher {
 private:
@@ -23,6 +25,8 @@ public:
         register_module(std::make_unique<AppManager>());
         register_module(std::make_unique<WebcamManager>());
         register_module(std::make_unique<KeyManager>());
+        register_module(std::make_unique<FileManager>());
+        register_module(std::make_unique<InputManager>());
     }
 
     void register_module(std::unique_ptr<IRemoteModule> module) {
