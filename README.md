@@ -512,7 +512,7 @@ Remote_Project/
 │   │       └── app.html
 │   │
 │   └── package.json
-│
+├── ui                           # Một số hình ảnh về giao diện chức năng
 ├── CMakeLists.txt               # Cấu hình build CMake
 ├── CMakePresets.json            # Preset build Windows / Linux
 ├── README.md                    # Tài liệu hướng dẫn sử dụng
