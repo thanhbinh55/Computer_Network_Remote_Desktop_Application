@@ -396,8 +396,8 @@ Hệ thống được triển khai và sử dụng **hoàn toàn trong mạng LA
 cd registry_server
 npm install
 node server.js
-Output mong đợi
 ```
+Output mong đợi:
 ```text
 [UDP] Discovery server listening...
 [UDP] Registry server running on port 3000
@@ -427,7 +427,6 @@ vcpkg (đã cấu hình trong dự án)
 Build & chạy
 ```bash
 mkdir build
-cd build
 cmake --preset windows-vcpkg
 cmake --build build/win --config Release
 ./build/win/Release/server.exe
@@ -517,9 +516,6 @@ Remote_Project/
 ├── CMakeLists.txt               # Cấu hình build CMake
 ├── CMakePresets.json            # Preset build Windows / Linux
 ├── README.md                    # Tài liệu hướng dẫn sử dụng
-├── LINK VIDEO YOUTUBE.txt       # Link video demo
-├── ĐỒ ÁN MÔN MẠNG MÁY TÍNH.pdf   # Báo cáo đồ án
-└── LOGAI_REMOTE_CONTROL_APP.docx
 ```
 🧩 Mô tả tổng quan
 
