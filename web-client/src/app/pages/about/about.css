@@ -189,3 +189,30 @@
   opacity: 1;
   box-shadow: 0 0 10px rgba(102,250,255,0.4);
 }
+.team-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 24px;
+  align-items: stretch; /* QUAN TRỌNG */
+}
+
+.team-card {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between; /* đẩy email xuống đáy */
+  height: 100%;
+}
+
+.team-card p {
+  line-height: 1.5;
+}
+
+.team-card .email {
+  margin-top: auto;
+  padding-top: 12px;
+  font-size: 14px;
+  opacity: 0.9;
+}
+.team-card p:not(.email) {
+  min-height: 48px;
+}
