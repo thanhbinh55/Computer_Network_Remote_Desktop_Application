@@ -1,97 +1,679 @@
 <section class="about-page">
-  <!-- HERO -->
+  <!-- LANGUAGE SWITCH -->
+<div class="lang-switch">
+  <button
+    class="lang-btn"
+    [class.active]="lang === 'en'"
+    (click)="switchLang('en')">EN</button>
+
+  <button
+    class="lang-btn"
+    [class.active]="lang === 'vi'"
+    (click)="switchLang('vi')">VI</button>
+</div>
+
+
+<!-- ================= ENGLISH VERSION ================= -->
+<div *ngIf="lang === 'en'">
+
+ <!-- HERO -->
   <div class="about-hero">
-    <h1>REMOTE AGENT CONTROL SYSTEM</h1>
+    <h1>REMOTE DESKTOP APPLICATION</h1>
     <p class="subtitle">
-      A real-time distributed control platform powered by WebSocket technology
+      A distributed LAN-based system for real-time remote control,
+      monitoring and system interaction – developed for
+      Computer Networking coursework
+    </p>
+  </div>
+
+  <!-- PROJECT PURPOSE -->
+  <div class="panel">
+    <h2>🎯 PROJECT PURPOSE</h2>
+    <p>
+      This project was developed to study and apply core concepts of
+      computer networking, including socket programming,
+      real-time communication and client–server architecture
+      within a controlled Local Area Network (LAN).
+    </p>
+    <p>
+      The system focuses on providing a practical remote desktop solution
+      without relying on Internet connectivity, cloud services
+      or external platforms.
     </p>
   </div>
 
   <!-- SYSTEM OVERVIEW -->
   <div class="panel">
-    <h2>SYSTEM OVERVIEW</h2>
+    <h2>🖥 SYSTEM OVERVIEW</h2>
     <p>
-      This project is a centralized control dashboard designed to manage,
-      monitor and interact with multiple remote agents in real time.
-      The system focuses on network communication, real-time data exchange,
-      and secure remote operations.
+      The Remote Desktop Application is composed of three main components:
+      a Web Client, a Registry Server and multiple Remote Agents.
+      Each Remote Agent runs as a background process on the target machine
+      and exposes system functionalities through a WebSocket-based interface.
+    </p>
+    <p>
+      The Web Client allows users to connect, monitor and control
+      remote machines in real time, while the Registry Server
+      supports automatic discovery of active agents within the LAN.
     </p>
   </div>
 
-  <!-- CORE FEATURES -->
-  <div class="panel">
-    <h2>CORE FEATURES</h2>
+ <!-- CORE CAPABILITIES -->
+<div class="panel">
+  <h2>⚙ CORE CAPABILITIES</h2>
 
-    <div class="features-grid">
-      <div class="feature-card">
-        <span class="icon">⚡</span>
-        <h3>Realtime Control</h3>
-        <p>
-          Establish persistent WebSocket connections to send commands
-          and receive responses instantly.
-        </p>
-      </div>
+  <p>
+    At a high level, the system provides a set of core capabilities
+    that define what the application can do
+    from an end-user perspective.
+  </p>
 
-      <div class="feature-card">
-        <span class="icon">🖥</span>
-        <h3>Agent Management</h3>
-        <p>
-          Monitor agent status, system information and active connections
-          from a centralized dashboard.
-        </p>
-      </div>
+  <div class="features-grid">
+    <div class="feature-card">
+      <span class="icon">⚡</span>
+      <h3>Real-time Interaction</h3>
+      <p>
+        Execute commands and receive responses
+        with minimal latency through persistent connections.
+      </p>
+    </div>
 
-      <div class="feature-card">
-        <span class="icon">🔐</span>
-        <h3>Security-Oriented Design</h3>
-        <p>
-          Focus on controlled access, encrypted transport
-          and restricted remote execution.
-        </p>
-      </div>
+    <div class="feature-card">
+      <span class="icon">👁</span>
+      <h3>System Visibility</h3>
+      <p>
+        Observe system state, resources and activities
+        from a centralized web interface.
+      </p>
+    </div>
+
+    <div class="feature-card">
+      <span class="icon">🕹</span>
+      <h3>Remote Operation</h3>
+      <p>
+        Interact with remote machines through
+        screen streaming and input forwarding.
+      </p>
+    </div>
+
+    <div class="feature-card">
+      <span class="icon">🌐</span>
+      <h3>LAN-native Design</h3>
+      <p>
+        Operate entirely inside local networks
+        without Internet dependency.
+      </p>
     </div>
   </div>
+</div>
+
+  <!-- MAIN FUNCTIONAL MODULES -->
+<div class="panel">
+  <h2>🧩 FUNCTIONAL MODULES</h2>
+  <p>
+    Internally, the system is implemented as a collection
+    of independent functional modules.
+    Each module encapsulates a specific domain of responsibility
+    and communicates through the command dispatcher.
+  </p>
+
+
+  <div class="features-grid">
+    <div class="feature-card">
+      <span class="icon">⚙️</span>
+      <h3>Process & App Manager</h3>
+      <p>
+        List, start and terminate system processes and applications
+        based on operating system permissions.
+      </p>
+    </div>
+
+    <div class="feature-card">
+      <span class="icon">📁</span>
+      <h3>File Manager</h3>
+      <p>
+        Browse directories, read and write text files,
+        and transfer files using binary data frames.
+      </p>
+    </div>
+
+    <div class="feature-card">
+      <span class="icon">🖥</span>
+      <h3>Screen & Remote Desktop</h3>
+      <p>
+        Capture screen frames and support interactive
+        remote desktop control with scalable performance.
+      </p>
+    </div>
+
+    <div class="feature-card">
+      <span class="icon">🎥</span>
+      <h3>Webcam & Media</h3>
+      <p>
+        Stream webcam data in real time with adaptive
+        frame rate and bandwidth optimization.
+      </p>
+    </div>
+
+    <div class="feature-card">
+      <span class="icon">⌨️</span>
+      <h3>Input & Key Logging</h3>
+      <p>
+        Capture keyboard and mouse input events
+        through operating system APIs.
+      </p>
+    </div>
+
+    <div class="feature-card">
+      <span class="icon">🔌</span>
+      <h3>System Control</h3>
+      <p>
+        Execute system-level commands such as shutdown,
+        restart or logoff with controlled execution flow.
+      </p>
+    </div>
+  </div>
+</div>
+
+
+
 
   <!-- TECHNOLOGY STACK -->
   <div class="panel">
-    <h2>TECHNOLOGY STACK</h2>
+    <h2>🧪 TECHNOLOGY STACK</h2>
 
     <div class="tech-list">
-      <div><label>Frontend</label><span>Angular (Standalone Components)</span></div>
-      <div><label>Backend</label><span>WebSocket-based Server</span></div>
-      <div><label>Protocol</label><span>TCP / WebSocket</span></div>
-      <div><label>Domain</label><span>Computer Networking & Security</span></div>
+      <div><label>Remote Agent</label><span>C++17, ASIO, nlohmann/json</span></div>
+      <div><label>Registry Server</label><span>Node.js, UDP, HTTP</span></div>
+      <div><label>Web Client</label><span>Angular, TypeScript, WebSocket</span></div>
+      <div><label>Protocols</label><span>TCP, UDP, WebSocket</span></div>
+      <div><label>Scope</label><span>Local Area Network (LAN)</span></div>
     </div>
   </div>
+<!-- SYSTEM ARCHITECTURE -->
+<div class="panel">
+  <h2>🏗 SYSTEM ARCHITECTURE</h2>
+
+  <p>
+    The system is designed around a distributed Client–Server architecture,
+    extended with a Registry Server to support automatic agent discovery
+    within the Local Area Network.
+  </p>
+
+  <div class="features-grid">
+    <div class="feature-card">
+      <span class="icon">🧠</span>
+      <h3>Control Plane</h3>
+      <p>
+        Command and configuration messages are transmitted
+        using structured JSON over WebSocket connections.
+      </p>
+    </div>
+
+    <div class="feature-card">
+      <span class="icon">📦</span>
+      <h3>Data Plane</h3>
+      <p>
+        High-volume data such as screen and webcam streams
+        are delivered as binary frames for performance efficiency.
+      </p>
+    </div>
+
+    <div class="feature-card">
+      <span class="icon">📡</span>
+      <h3>Discovery Layer</h3>
+      <p>
+        UDP broadcast is used exclusively for agent discovery,
+        eliminating the need for manual IP configuration.
+      </p>
+    </div>
+  </div>
+</div>
+
+
+
+  <!-- SECURITY -->
+  <div class="panel">
+    <h2>🔐 SECURITY & LIMITATIONS</h2>
+    <p>
+      The system is intentionally restricted to LAN environments
+      and does not support Internet-based access.
+      No kernel-level operations, drivers or privilege escalation
+      mechanisms are implemented.
+    </p>
+    <p>
+      Sensitive browser data such as passwords or cookies
+      are excluded from data collection,
+      ensuring ethical compliance and safe usage.
+    </p>
+  </div>
+  <!-- COURSE INSTRUCTOR -->
+<div class="panel instructor-panel">
+  <h2>🎓 COURSE INSTRUCTOR</h2>
+
+  <div class="instructor-card">
+    <h3>MS. Do Hoang Cuong</h3>
+
+    <p class="role">
+      Lecturer – Computer Networking
+    </p>
+
+    <p class="course">
+      Course: Computer Networking (CNTN2024)
+    </p>
+
+    <p class="note">
+      This project was developed under academic supervision
+      as part of the Computer Networking coursework.
+    </p>
+  </div>
+</div>
+
 
   <!-- TEAM -->
   <div class="panel">
-    <h2>PROJECT TEAM</h2>
+    <h2>👥 PROJECT TEAM</h2>
 
     <div class="team-grid">
       <div class="team-card">
         <div class="avatar">01</div>
         <h3>Nguyễn Ngọc Phúc</h3>
-        <p>Frontend & System Architecture</p>
+        <p>Web Client, UDP Discovery, Registry Server</p>
+         <p class="email">📧 nguyenngocphucmkkt@gmail.com</p>
       </div>
 
       <div class="team-card">
         <div class="avatar">02</div>
-        <h3>Team Member</h3>
-        <p>Backend & WebSocket</p>
+        <h3>Ngô Viết Thanh Bình</h3>
+        <p>Remote Server (Windows), Architecture, Report</p>
+         <p class="email">📧 ngovietthanhbinh2006@gmail.com</p>
       </div>
 
       <div class="team-card">
         <div class="avatar">03</div>
-        <h3>Team Member</h3>
-        <p>Network & Security Analysis</p>
+        <h3>Nguyễn Đức Lãm</h3>
+        <p>Remote Server (Linux), Testing</p>
+         <p class="email">📧 lamnguyenduc0118@gmail.com</p>
       </div>
     </div>
   </div>
+  <!-- LICENSE -->
+<div class="panel">
+  <h2>📄 LICENSE</h2>
+  <p>
+    This project is not released under a commercial software license.
+    The source code is provided solely for educational
+    and academic purposes within the scope of the coursework.
+  </p>
+  <p>
+    Redistribution or commercial usage of the system
+    is not permitted without explicit authorization.
+  </p>
+</div>
+<!-- DISCLAIMER -->
+<div class="panel">
+  <h2>⚠️ DISCLAIMER</h2>
+  <p>
+    This software is developed strictly for educational
+    and research purposes in a controlled environment.
+  </p>
+  <p>
+    Unauthorized access to computer systems,
+    invasion of privacy or violation of applicable laws
+    using this software is strictly prohibited.
+  </p>
+  <p>
+    Users are fully responsible for ensuring that
+    the system is used only on machines
+    they own or are explicitly authorized to access.
+  </p>
+</div>
 
-  <!-- FOOTER NOTE -->
+
+  <!-- FOOTER -->
   <div class="about-footer">
-    <span>[ SYSTEM STATUS ]</span>
-    <span>READY FOR DEMONSTRATION</span>
+    <span>[ LAN-ONLY SYSTEM ]</span>
+    <span>ACADEMIC PROJECT – READY FOR DEMONSTRATION</span>
   </div>
+
+</div>
+<!-- ================= VIETNAMESE VERSION ================= -->
+<div *ngIf="lang === 'vi'">
+
+  <!-- HERO -->
+  <div class="about-hero">
+    <h1>ỨNG DỤNG ĐIỀU KHIỂN MÁY TÍNH TỪ XA</h1>
+    <p class="subtitle">
+      Hệ thống điều khiển và giám sát máy tính theo thời gian thực
+      trong mạng cục bộ (LAN), phục vụ mục đích học tập
+      môn Mạng Máy Tính
+    </p>
+  </div>
+
+  <!-- PROJECT PURPOSE -->
+  <div class="panel">
+    <h2>🎯 MỤC TIÊU ĐỒ ÁN</h2>
+    <p>
+      Đồ án được thực hiện nhằm nghiên cứu và áp dụng các kiến thức
+      cốt lõi của môn Mạng Máy Tính, bao gồm lập trình socket,
+      giao tiếp thời gian thực và kiến trúc Client–Server.
+    </p>
+    <p>
+      Hệ thống được thiết kế hoạt động hoàn toàn trong phạm vi
+      mạng cục bộ (LAN), không phụ thuộc Internet
+      hay các dịch vụ bên ngoài.
+    </p>
+  </div>
+
+  <!-- SYSTEM OVERVIEW -->
+  <div class="panel">
+    <h2>🖥 TỔNG QUAN HỆ THỐNG</h2>
+    <p>
+      Hệ thống bao gồm ba thành phần chính:
+      Web Client, Registry Server và các Remote Agent.
+      Mỗi Agent chạy nền trên máy bị điều khiển
+      và cung cấp các chức năng hệ thống thông qua WebSocket.
+    </p>
+    <p>
+      Web Client cho phép người dùng giám sát và điều khiển máy từ xa,
+      trong khi Registry Server hỗ trợ phát hiện
+      và quản lý các Agent đang hoạt động trong mạng LAN.
+    </p>
+  </div>
+
+ <!-- CORE CAPABILITIES -->
+<div class="panel">
+  <h2>⚙ NĂNG LỰC CỐT LÕI</h2>
+
+  <p>
+    Ở mức tổng quát, hệ thống cung cấp một tập các năng lực cốt lõi,
+    mô tả những gì ứng dụng có thể thực hiện
+    từ góc nhìn của người dùng cuối.
+  </p>
+
+  <div class="features-grid">
+    <div class="feature-card">
+      <span class="icon">⚡</span>
+      <h3>Tương tác thời gian thực</h3>
+      <p>
+        Thực thi lệnh và nhận phản hồi
+        với độ trễ thấp thông qua các kết nối duy trì liên tục.
+      </p>
+    </div>
+
+    <div class="feature-card">
+      <span class="icon">👁</span>
+      <h3>Khả năng quan sát hệ thống</h3>
+      <p>
+        Theo dõi trạng thái, tài nguyên và hoạt động của hệ thống
+        thông qua một giao diện web tập trung.
+      </p>
+    </div>
+
+    <div class="feature-card">
+      <span class="icon">🕹</span>
+      <h3>Vận hành từ xa</h3>
+      <p>
+        Tương tác với các máy tính từ xa thông qua
+        truyền màn hình và chuyển tiếp sự kiện đầu vào.
+      </p>
+    </div>
+
+    <div class="feature-card">
+      <span class="icon">🌐</span>
+      <h3>Thiết kế tối ưu cho mạng LAN</h3>
+      <p>
+        Hệ thống hoạt động hoàn toàn trong mạng cục bộ,
+        không phụ thuộc vào kết nối Internet.
+      </p>
+    </div>
+  </div>
+</div>
+
+<!-- MAIN FUNCTIONAL MODULES -->
+<div class="panel">
+  <h2>🧩 CÁC MODULE CHỨC NĂNG</h2>
+  <p>
+    Về mặt triển khai, hệ thống được xây dựng dưới dạng
+    tập hợp các module chức năng độc lập.
+    Mỗi module đảm nhiệm một phạm vi trách nhiệm riêng
+    và giao tiếp thông qua bộ điều phối lệnh (Command Dispatcher).
+  </p>
+
+  <div class="features-grid">
+    <div class="feature-card">
+      <span class="icon">⚙️</span>
+      <h3>Quản lý tiến trình & ứng dụng</h3>
+      <p>
+        Liệt kê, khởi chạy và kết thúc các tiến trình
+        hoặc ứng dụng dựa trên quyền của hệ điều hành.
+      </p>
+    </div>
+
+    <div class="feature-card">
+      <span class="icon">📁</span>
+      <h3>Quản lý tập tin</h3>
+      <p>
+        Duyệt thư mục, đọc và ghi tập tin văn bản,
+        cũng như truyền tập tin thông qua dữ liệu nhị phân.
+      </p>
+    </div>
+
+    <div class="feature-card">
+      <span class="icon">🖥</span>
+      <h3>Màn hình & điều khiển từ xa</h3>
+      <p>
+        Chụp và truyền khung hình màn hình,
+        hỗ trợ điều khiển máy tính từ xa
+        với khả năng mở rộng hiệu năng.
+      </p>
+    </div>
+
+    <div class="feature-card">
+      <span class="icon">🎥</span>
+      <h3>Webcam & đa phương tiện</h3>
+      <p>
+        Truyền dữ liệu webcam theo thời gian thực
+        với khả năng điều chỉnh tốc độ khung hình
+        và tối ưu băng thông.
+      </p>
+    </div>
+
+    <div class="feature-card">
+      <span class="icon">⌨️</span>
+      <h3>Thu thập sự kiện nhập liệu</h3>
+      <p>
+        Ghi nhận các sự kiện bàn phím và chuột
+        thông qua các API của hệ điều hành.
+      </p>
+    </div>
+
+    <div class="feature-card">
+      <span class="icon">🔌</span>
+      <h3>Điều khiển hệ thống</h3>
+      <p>
+        Thực thi các lệnh ở mức hệ thống
+        như tắt máy, khởi động lại hoặc đăng xuất
+        với quy trình kiểm soát chặt chẽ.
+      </p>
+    </div>
+  </div>
+</div>
+
+<!-- TECHNOLOGY STACK -->
+<div class="panel">
+  <h2>🧪 CÔNG NGHỆ SỬ DỤNG</h2>
+
+  <div class="tech-list">
+    <div><label>Remote Agent</label><span>C++17, ASIO, nlohmann/json</span></div>
+    <div><label>Registry Server</label><span>Node.js, UDP, HTTP</span></div>
+    <div><label>Web Client</label><span>Angular, TypeScript, WebSocket</span></div>
+    <div><label>Giao thức</label><span>TCP, UDP, WebSocket</span></div>
+    <div><label>Phạm vi</label><span>Mạng cục bộ (LAN)</span></div>
+  </div>
+</div>
+
+<!-- SYSTEM ARCHITECTURE -->
+<div class="panel">
+  <h2>🏗 KIẾN TRÚC HỆ THỐNG</h2>
+
+  <p>
+    Hệ thống được thiết kế theo mô hình Client–Server phân tán,
+    kết hợp với Registry Server nhằm hỗ trợ
+    phát hiện tự động các Agent trong mạng cục bộ.
+  </p>
+
+  <div class="features-grid">
+    <div class="feature-card">
+      <span class="icon">🧠</span>
+      <h3>Luồng điều khiển (Control Plane)</h3>
+      <p>
+        Các lệnh và thông tin cấu hình được truyền
+        dưới dạng JSON có cấu trúc
+        thông qua kết nối WebSocket.
+      </p>
+    </div>
+
+    <div class="feature-card">
+      <span class="icon">📦</span>
+      <h3>Luồng dữ liệu (Data Plane)</h3>
+      <p>
+        Các dữ liệu có dung lượng lớn
+        như hình ảnh màn hình hoặc webcam
+        được truyền dưới dạng khung dữ liệu nhị phân
+        để đảm bảo hiệu năng.
+      </p>
+    </div>
+
+    <div class="feature-card">
+      <span class="icon">📡</span>
+      <h3>Lớp phát hiện (Discovery Layer)</h3>
+      <p>
+        Giao thức UDP broadcast được sử dụng
+        riêng cho mục đích phát hiện Agent,
+        loại bỏ nhu cầu cấu hình địa chỉ IP thủ công.
+      </p>
+    </div>
+  </div>
+</div>
+
+<!-- SECURITY -->
+<div class="panel">
+  <h2>🔐 BẢO MẬT & GIỚI HẠN</h2>
+  <p>
+    Hệ thống được giới hạn hoạt động trong mạng LAN
+    và không hỗ trợ truy cập qua Internet.
+    Không triển khai các thao tác ở mức kernel,
+    driver hoặc cơ chế leo thang đặc quyền.
+  </p>
+  <p>
+    Các dữ liệu nhạy cảm của trình duyệt
+    như mật khẩu hoặc cookie
+    không được thu thập,
+    nhằm đảm bảo tuân thủ đạo đức và an toàn thông tin.
+  </p>
+</div>
+<!-- COURSE INSTRUCTOR -->
+<div class="panel instructor-panel">
+  <h2>🎓 GIÁO VIÊN HƯỚNG DẪN</h2>
+
+  <div class="instructor-card">
+    <h3>ThS. Đỗ Hoàng Cường</h3>
+
+    <p class="role">
+      Giảng viên – Môn Mạng Máy Tính
+    </p>
+
+    <p class="course">
+      Học phần: Mạng Máy Tính (CNTN2024)
+    </p>
+
+    <p class="note">
+      Đồ án được thực hiện dưới sự hướng dẫn học thuật
+      trong khuôn khổ môn học Mạng Máy Tính.
+    </p>
+  </div>
+</div>
+
+
+<!-- TEAM -->
+<div class="panel">
+  <h2>👥 NHÓM THỰC HIỆN</h2>
+
+  <div class="team-grid">
+    <div class="team-card">
+      <div class="avatar">01</div>
+      <h3>Nguyễn Ngọc Phúc</h3>
+      <p>Web Client, UDP Discovery, Registry Server          </p>
+      <p class="email">📧 nguyenngocphucmkkt@gmail.com</p>
+    </div>
+
+    <div class="team-card">
+      <div class="avatar">02</div>
+      <h3>Ngô Viết Thanh Bình</h3>
+      <p>Remote Server (Windows), Kiến trúc hệ thống, Báo cáo</p>
+      <p class="email">📧 ngovietthanhbinh2006@gmail.com</p>
+    </div>
+
+    <div class="team-card">
+      <div class="avatar">03</div>
+      <h3>Nguyễn Đức Lãm</h3>
+      <p>Remote Server (Linux), Kiểm thử </p>
+      <p class="email">📧 lamnguyenduc0118@gmail.com</p>
+    </div>
+  </div>
+</div>
+
+<!-- LICENSE -->
+<div class="panel">
+  <h2>📄 GIẤY PHÉP</h2>
+  <p>
+    Dự án không được phát hành dưới dạng
+    phần mềm thương mại.
+    Mã nguồn chỉ được sử dụng
+    cho mục đích học tập và nghiên cứu
+    trong khuôn khổ môn học.
+  </p>
+  <p>
+    Mọi hình thức phân phối lại hoặc sử dụng
+    cho mục đích thương mại
+    đều không được phép
+    nếu không có sự cho phép rõ ràng.
+  </p>
+</div>
+
+<!-- DISCLAIMER -->
+<div class="panel">
+  <h2>⚠️ TUYÊN BỐ MIỄN TRỪ TRÁCH NHIỆM</h2>
+  <p>
+    Phần mềm này được phát triển
+    chỉ phục vụ mục đích học tập và nghiên cứu
+    trong môi trường có kiểm soát.
+  </p>
+  <p>
+    Nghiêm cấm mọi hành vi truy cập trái phép,
+    xâm phạm quyền riêng tư
+    hoặc vi phạm pháp luật
+    khi sử dụng phần mềm.
+  </p>
+  <p>
+    Người sử dụng hoàn toàn chịu trách nhiệm
+    trong việc đảm bảo hệ thống
+    chỉ được vận hành trên các máy tính
+    mà họ sở hữu
+    hoặc được cấp quyền hợp lệ.
+  </p>
+</div>
+
+<!-- FOOTER -->
+<div class="about-footer">
+  <span>[ HỆ THỐNG CHỈ HOẠT ĐỘNG TRONG LAN ]</span>
+  <span>ĐỒ ÁN HỌC TẬP – SẴN SÀNG TRÌNH DIỄN</span>
+</div>
+
+
+</div>
+
+ 
+
 </section>

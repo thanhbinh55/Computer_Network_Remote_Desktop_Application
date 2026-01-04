@@ -443,6 +443,7 @@ http://localhost:4200
 ```
 ▶️ Hướng dẫn sử dụng
 Thứ tự khởi động hệ thống
+
 1.Chạy Registry Server
 
 2.Chạy Remote Server trên máy bị điều khiển
