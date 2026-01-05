@@ -423,7 +423,11 @@ Visual Studio 2022
 CMake
 
 vcpkg (đã cấu hình trong dự án)
-
+hoặc cài đặt
+```bash
+cd C:\dev\vcpkg
+.\vcpkg install openssl:x64-windows boost-system:x64-windows nlohmann-json:x64-windows
+```
 Build & chạy
 ```bash
 mkdir build
